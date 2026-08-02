@@ -251,6 +251,14 @@ auto-commits the new version and pinned digest to the
 key — Umbrel then offers the update. Never hand-edit those two store files.
 `ci.yml` runs vet + tests + an arm64 build check on every push and PR.
 
+**Tagging is part of shipping, not a separate request.** When a change that
+affects the running bot lands on master, cut and push the tag as the last step
+— without asking. Docs-, test- and CI-only changes are not released. Version
+rules, preconditions, and the exact commands live in the `releasing` skill
+(`.claude/skills/releasing/SKILL.md`); keep the two in sync when either
+changes. A pushed tag is immutable: fix a bad release by releasing forward, not
+by moving a tag.
+
 ## This repo is public
 
 Keep code, tests, docs, and commit messages free of personal details — no real

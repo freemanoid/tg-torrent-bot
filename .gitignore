@@ -1,0 +1,16 @@
+# local secrets
+.env
+
+# build output
+/bot
+/tg-torrent-bot
+dist/
+
+# runtime data
+data/
+*.db
+
+# editor/OS noise
+.DS_Store
+.idea/
+.vscode/

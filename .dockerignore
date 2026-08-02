@@ -1,0 +1,15 @@
+# Keep the build context minimal — only Go sources and module files matter.
+.git
+.env
+.env.example
+data/
+*.db
+docs/
+dist/
+/bot
+/tg-torrent-bot
+docker-compose.yml
+Dockerfile
+.DS_Store
+.idea/
+.vscode/

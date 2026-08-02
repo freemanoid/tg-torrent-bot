@@ -8,6 +8,7 @@ import (
 	"github.com/freemanoid/tg-torrent-bot/internal/mediainfo"
 	"github.com/freemanoid/tg-torrent-bot/internal/prowlarr"
 	"github.com/freemanoid/tg-torrent-bot/internal/store"
+	"github.com/freemanoid/tg-torrent-bot/internal/torrentmeta"
 )
 
 // perPage is how many results one page shows. Each one now carries its full
@@ -31,6 +32,7 @@ const blockIndent = "   "
 const (
 	cbDownload = "dl" // n = release index within the cached search
 	cbPage     = "pg" // n = keyboard page to show
+	cbInfo     = "if" // n = release index to describe in full
 )
 
 // Markers stating what the bot already did with a release. They reuse the
@@ -119,26 +121,37 @@ func buttonLabel(n int, r prowlarr.Release, mark string) string {
 // line, which is more useful than a row of "unknown" placeholders. mark, when
 // set, leads the title line so it survives the block's rune budget.
 func releaseBlock(n int, r prowlarr.Release, mark string) string {
-	info := mediainfo.Parse(r.Title)
 	lines := []string{fmt.Sprintf("%d. %s", n, joinNonEmpty(" ", mark, r.Title))}
-	add := func(s string) {
-		if s != "" {
-			lines = append(lines, blockIndent+s)
+	for _, l := range releaseLines(r) {
+		lines = append(lines, blockIndent+l)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// releaseLines are the detail lines both views share: what the release weighs
+// and where it came from, then what its title says about the media. Empty
+// lines are dropped, so an unstated field leaves no blank row behind.
+func releaseLines(r prowlarr.Release) []string {
+	info := mediainfo.Parse(r.Title)
+	candidates := []string{
+		joinNonEmpty(" · ", sizeLabel(r), swarm(r), r.Indexer),
+		joinNonEmpty(" · ",
+			joinNonEmpty(" ", info.Resolution, info.Source),
+			info.Video(),
+			strings.Join(info.HDR, " "),
+			info.Container,
+			info.Bitrate),
+		audioLine(info),
+		subsLine(info),
+		compatLine(info),
+	}
+	lines := make([]string, 0, len(candidates))
+	for _, l := range candidates {
+		if l != "" {
+			lines = append(lines, l)
 		}
 	}
-
-	add(joinNonEmpty(" · ", sizeLabel(r), swarm(r), r.Indexer))
-	add(joinNonEmpty(" · ",
-		joinNonEmpty(" ", info.Resolution, info.Source),
-		info.Video(),
-		strings.Join(info.HDR, " "),
-		info.Container,
-		info.Bitrate))
-	add(audioLine(info))
-	add(subsLine(info))
-	add(compatLine(info))
-
-	return strings.Join(lines, "\n")
+	return lines
 }
 
 // audioLine reports the two axes a tracker title states separately: which
@@ -319,6 +332,137 @@ func resultsMessage(query string, releases []prowlarr.Release, page int, marks m
 		parts = append(parts, truncateUnits(releaseBlock(i+1, releases[i], marks[i]), budget))
 	}
 	return strings.Join(parts, "\n\n")
+}
+
+// Details view budgets, all in the UTF-16 code units Telegram counts. Like the
+// results message, the details message carries an inline keyboard and so
+// cannot be split across sends — it has to fit in one message or it is lost.
+const (
+	maxFileLines        = 30   // file rows shown before the "and N more" tail
+	maxFilePathUnits    = 110  // one file path, so a deep tree cannot eat the page
+	maxDescriptionUnits = 700  // the indexer's free text
+	maxDetailTitleUnits = 400  // the release title, shown in full unless absurd
+	filesReserveUnits   = 1600 // room held back for the file list before the head is cut
+)
+
+// publishFormat renders a release's publish date; the time of day says nothing
+// useful about a tracker upload.
+const publishFormat = "2006-01-02"
+
+// detailsHeader is the first line of the details message.
+func detailsHeader(n int, r prowlarr.Release, mark string) string {
+	title := truncateUnits(r.Title, maxDetailTitleUnits)
+	return fmt.Sprintf("ℹ️ %d. %s", n, joinNonEmpty(" ", mark, title))
+}
+
+// provenanceLines are the facts the indexer states about the release rather
+// than the media: when it was published, how often it was taken, and where its
+// page is. Prowlarr fills these in per indexer, so most are often absent.
+func provenanceLines(r prowlarr.Release) []string {
+	var lines []string
+	published := ""
+	if !r.PublishDate.IsZero() {
+		published = "Published " + r.PublishDate.UTC().Format(publishFormat)
+	}
+	grabs := ""
+	if r.Grabs > 0 {
+		grabs = fmt.Sprintf("%d grab(s)", r.Grabs)
+	}
+	if l := joinNonEmpty(" · ", published, grabs); l != "" {
+		lines = append(lines, l)
+	}
+	if r.InfoURL != "" {
+		lines = append(lines, r.InfoURL)
+	}
+	return lines
+}
+
+// detailsMessage renders everything known about one release before it is
+// downloaded: the untruncated title, every detail line, what the indexer says
+// about it, and the file list read out of the .torrent.
+//
+// meta is nil when the metainfo could not be read — the common case for a
+// magnet-only release, whose Prowlarr downloadUrl redirects to a magnet the
+// HTTP fetch cannot follow. unavailable then explains why, and the view still
+// shows everything else: the download itself will work through the magnet.
+func detailsMessage(n int, r prowlarr.Release, mark string, meta *torrentmeta.Meta, unavailable string) string {
+	lines := []string{detailsHeader(n, r, mark)}
+	for _, l := range releaseLines(r) {
+		lines = append(lines, blockIndent+l)
+	}
+	for _, l := range provenanceLines(r) {
+		lines = append(lines, blockIndent+l)
+	}
+	head := strings.Join(lines, "\n")
+	if d := strings.TrimSpace(r.Description); d != "" {
+		head += "\n\n" + truncateUnits(d, maxDescriptionUnits)
+	}
+
+	reserve := filesReserveUnits
+	if meta == nil {
+		reserve = 200 // just the one "unavailable" line
+	}
+	head = truncateUnits(head, maxMessageUnits-reserve)
+
+	files := filesSection(r, meta, unavailable, maxMessageUnits-utf16Len(head)-2)
+	if files == "" {
+		return head
+	}
+	return head + "\n\n" + files
+}
+
+// filesSection renders the file list within budget, always leaving room for
+// the line that says how many files were left out — dropping that line is how
+// a truncated list turns into a lie about what the torrent contains.
+func filesSection(r prowlarr.Release, meta *torrentmeta.Meta, unavailable string, budget int) string {
+	if meta == nil {
+		return truncateUnits(joinNonEmpty(" ", "📁", indexerFileCount(r), unavailable), budget)
+	}
+
+	header := fmt.Sprintf("📁 %d file(s) · %s", len(meta.Files), humanSize(meta.TotalSize))
+	used := utf16Len(header)
+	shown := make([]string, 0, min(len(meta.Files), maxFileLines))
+	for i, f := range meta.Files {
+		if i == maxFileLines {
+			break
+		}
+		line := blockIndent + truncateUnits(f.Path, maxFilePathUnits) + " — " + humanSize(f.Length)
+		// Room for this line plus the tail it would leave behind; the tail can
+		// only get shorter as fewer files remain, so this never under-reserves.
+		tail := moreFilesLine(len(meta.Files) - i - 1)
+		if used+1+utf16Len(line)+1+utf16Len(tail) > budget {
+			break
+		}
+		used += 1 + utf16Len(line)
+		shown = append(shown, line)
+	}
+
+	out := header
+	if len(shown) > 0 {
+		out += "\n" + strings.Join(shown, "\n")
+	}
+	if tail := moreFilesLine(len(meta.Files) - len(shown)); tail != "" {
+		out += "\n" + tail
+	}
+	return out
+}
+
+// indexerFileCount reports the file count Prowlarr carries, for the releases
+// whose metainfo could not be read at all.
+func indexerFileCount(r prowlarr.Release) string {
+	if r.FileCount <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("%d file(s) —", r.FileCount)
+}
+
+// moreFilesLine states how many files the list left out, and nothing when it
+// left out none.
+func moreFilesLine(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("%s… and %d more file(s)", blockIndent, n)
 }
 
 // encodeCallback packs a kind, search ID, and index into callback data; with

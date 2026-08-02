@@ -12,6 +12,7 @@ import (
 	"github.com/freemanoid/tg-torrent-bot/internal/grab"
 	"github.com/freemanoid/tg-torrent-bot/internal/prowlarr"
 	"github.com/freemanoid/tg-torrent-bot/internal/store"
+	"github.com/freemanoid/tg-torrent-bot/internal/torrentmeta"
 	"github.com/freemanoid/tg-torrent-bot/internal/transmission"
 )
 
@@ -83,17 +84,17 @@ func (h *Handlers) HandleText(ctx context.Context, api telegramAPI, update *mode
 
 	releases, err := h.searcher.Search(ctx, query)
 	if err != nil {
-		h.answerSearch(ctx, api, ack, "Search failed: "+err.Error(), nil)
+		h.answer(ctx, api, ack, "Search failed: "+err.Error(), nil)
 		return
 	}
 	if len(releases) == 0 {
-		h.answerSearch(ctx, api, ack, fmt.Sprintf("No results for «%s».", query), nil)
+		h.answer(ctx, api, ack, fmt.Sprintf("No results for «%s».", query), nil)
 		return
 	}
 
 	id := h.cache.Put(cachedSearch{Query: query, Releases: releases})
 	marks := h.pageMarks(ctx, releases, 0)
-	h.answerSearch(ctx, api, ack,
+	h.answer(ctx, api, ack,
 		resultsMessage(query, releases, 0, marks),
 		resultsKeyboard(id, releases, 0, marks))
 }
@@ -159,26 +160,30 @@ func (h *Handlers) pageMarks(ctx context.Context, releases []prowlarr.Release, p
 // ackSearching posts a placeholder before a Prowlarr search so the chat shows
 // the query was picked up: a search regularly runs for minutes (a cold
 // FlareSolverr Cloudflare challenge alone measured ~193 s) and a silent bot
-// looks stuck. It returns the message ID to edit the answer into, or 0 when
-// the ack could not be sent — losing it must never cost the user their answer.
+// looks stuck.
 func (h *Handlers) ackSearching(ctx context.Context, api telegramAPI, query string) int {
-	msg, err := api.SendMessage(ctx, &bot.SendMessageParams{
-		ChatID: h.chatID,
-		Text:   fmt.Sprintf("🔎 Searching «%s»…", query),
-	})
+	return h.ack(ctx, api, fmt.Sprintf("🔎 Searching «%s»…", query))
+}
+
+// ack posts a placeholder message and returns the ID to edit the real answer
+// into, or 0 when it could not be sent — losing the ack must never cost the
+// user their answer.
+func (h *Handlers) ack(ctx context.Context, api telegramAPI, text string) int {
+	msg, err := api.SendMessage(ctx, &bot.SendMessageParams{ChatID: h.chatID, Text: text})
 	if err != nil {
-		h.log.Warn("send search ack", "error", err)
+		h.log.Warn("send ack", "error", err)
 		return 0
 	}
 	return msg.ID
 }
 
-// answerSearch turns the ack message into the final answer, falling back to a
-// fresh message when there is no ack or the edit fails. A results answer must
-// stay one message — the keyboard is attached to it — so it is never chunked;
-// resultsMessage is what keeps it inside Telegram's limit. The nil-keyboard
-// path still routes through h.reply for the odd long error.
-func (h *Handlers) answerSearch(ctx context.Context, api telegramAPI, ack int, text string, kb models.ReplyMarkup) {
+// answer turns an ack message into the final answer, falling back to a fresh
+// message when there is no ack or the edit fails. An answer that carries a
+// keyboard must stay one message — the keyboard is attached to it — so it is
+// never chunked; resultsMessage and detailsMessage are what keep those inside
+// Telegram's limit. The nil-keyboard path still routes through h.reply for the
+// odd long error.
+func (h *Handlers) answer(ctx context.Context, api telegramAPI, ack int, text string, kb models.ReplyMarkup) {
 	if ack != 0 {
 		_, err := api.EditMessageText(ctx, &bot.EditMessageTextParams{
 			ChatID:      h.chatID,
@@ -189,19 +194,20 @@ func (h *Handlers) answerSearch(ctx context.Context, api telegramAPI, ack int, t
 		if err == nil {
 			return
 		}
-		h.log.Warn("edit search ack", "error", err)
+		h.log.Warn("edit ack", "error", err)
 	}
 	if kb == nil {
 		h.reply(ctx, api, text)
 		return
 	}
 	if _, err := api.SendMessage(ctx, &bot.SendMessageParams{ChatID: h.chatID, Text: text, ReplyMarkup: kb}); err != nil {
-		h.log.Error("send search results", "error", err)
+		h.log.Error("send answer", "error", err)
 	}
 }
 
 // HandleCallback processes inline-keyboard taps: dl:<id>:<idx> downloads a
-// release, pg:<id>:<page> flips the keyboard to another page.
+// release, if:<id>:<idx> describes one in full, pg:<id>:<page> flips the
+// keyboard to another page.
 func (h *Handlers) HandleCallback(ctx context.Context, api telegramAPI, update *models.Update) {
 	cb := update.CallbackQuery
 	if cb == nil {
@@ -228,6 +234,8 @@ func (h *Handlers) HandleCallback(ctx context.Context, api telegramAPI, update *
 		h.flipPage(ctx, api, cb, searchID, entry, n)
 	case cbDownload:
 		h.download(ctx, api, entry, n)
+	case cbInfo:
+		h.details(ctx, api, searchID, entry, n)
 	default:
 		h.log.Warn("unknown callback kind", "data", cb.Data)
 	}
@@ -256,6 +264,64 @@ func (h *Handlers) flipPage(ctx context.Context, api telegramAPI, cb *models.Cal
 	if _, err := api.SendMessage(ctx, &bot.SendMessageParams{ChatID: h.chatID, Text: text, ReplyMarkup: kb}); err != nil {
 		h.log.Error("send results page", "error", err)
 	}
+}
+
+// details answers a ℹ️ tap with everything the bot can learn about one release
+// without downloading it: its untruncated title and detail lines, what the
+// indexer says about it, and the file list read out of the .torrent. It is
+// sent as its own message carrying a download button, so the results message —
+// and the search behind it — stays intact underneath.
+func (h *Handlers) details(ctx context.Context, api telegramAPI, searchID string, entry cachedSearch, idx int) {
+	if idx < 0 || idx >= len(entry.Releases) {
+		h.reply(ctx, api, "That result is no longer available — please search again.")
+		return
+	}
+	r := entry.Releases[idx]
+
+	// Fetching the .torrent goes through Prowlarr and the tracker, so it is
+	// slow often enough to deserve the same ack a search gets.
+	ack := h.ack(ctx, api, fmt.Sprintf("📄 Reading «%s»…", truncate(r.Title, maxHeaderQueryRunes)))
+
+	meta, unavailable := h.releaseMeta(ctx, r)
+	marks := h.pageMarks(ctx, entry.Releases, idx/perPage)
+	h.answer(ctx, api, ack,
+		detailsMessage(idx+1, r, marks[idx], meta, unavailable),
+		detailsKeyboard(searchID, idx))
+}
+
+// releaseMeta fetches and parses the release's .torrent for its file list,
+// returning nil plus a reason the details view can show when that is not
+// possible. Failing to read it is ordinary, not exceptional: a magnet-only
+// release has no .torrent to fetch, and Prowlarr answers magnet-backed
+// downloadUrls with a redirect to a magnet: URI the HTTP fetch cannot follow.
+//
+// The bytes are deliberately not cached. A .torrent can be tens of megabytes
+// and the host is a RAM-tight Pi shared with every other Umbrel app; holding
+// blobs for an hour to save a rare second tap is the wrong trade.
+func (h *Handlers) releaseMeta(ctx context.Context, r prowlarr.Release) (*torrentmeta.Meta, string) {
+	if r.DownloadURL == "" {
+		return nil, "file list unavailable: magnet-only release."
+	}
+	raw, err := h.searcher.FetchTorrent(ctx, r.DownloadURL)
+	if err != nil {
+		h.log.Warn("fetch torrent for details", "title", r.Title, "error", err)
+		return nil, "file list unavailable: the .torrent could not be fetched."
+	}
+	meta, err := torrentmeta.Parse(raw)
+	if err != nil {
+		h.log.Warn("parse torrent for details", "title", r.Title, "error", err)
+		return nil, "file list unavailable: the .torrent could not be read."
+	}
+	return &meta, ""
+}
+
+// detailsKeyboard puts the download one tap away from the details that
+// justified it, reusing the results message's own download callback.
+func detailsKeyboard(searchID string, idx int) *models.InlineKeyboardMarkup {
+	return &models.InlineKeyboardMarkup{InlineKeyboard: [][]models.InlineKeyboardButton{{{
+		Text:         "⬇️ Download",
+		CallbackData: encodeCallback(cbDownload, searchID, idx),
+	}}}}
 }
 
 // download hands the tapped release to Transmission and confirms in chat.
@@ -323,12 +389,26 @@ func resultsKeyboard(searchID string, releases []prowlarr.Release, page int, mar
 	page = clampPage(len(releases), page)
 	start, end := pageBounds(len(releases), page)
 
-	rows := make([][]models.InlineKeyboardButton, 0, end-start+1)
+	rows := make([][]models.InlineKeyboardButton, 0, end-start+2)
 	for i := start; i < end; i++ {
 		rows = append(rows, []models.InlineKeyboardButton{{
 			Text:         buttonLabel(i+1, releases[i], marks[i]),
 			CallbackData: encodeCallback(cbDownload, searchID, i),
 		}})
+	}
+
+	// The details buttons share one row rather than sitting next to their
+	// result: Telegram splits a row's width evenly, and pairing them would
+	// halve the quality summary the result label is there to carry.
+	info := make([]models.InlineKeyboardButton, 0, end-start)
+	for i := start; i < end; i++ {
+		info = append(info, models.InlineKeyboardButton{
+			Text:         fmt.Sprintf("ℹ️%d", i+1),
+			CallbackData: encodeCallback(cbInfo, searchID, i),
+		})
+	}
+	if len(info) > 0 {
+		rows = append(rows, info)
 	}
 
 	var nav []models.InlineKeyboardButton

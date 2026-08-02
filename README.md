@@ -201,6 +201,37 @@ line. The Apple TV 4K verdict assumes a third-party player (Infuse, Plex, VLC);
 under that profile only AV1 and 3D are flagged, since the built-in tvOS player
 would reject nearly every tracker release for its container alone.
 
+### Looking before you download
+
+Under the result buttons sits a row of **ℹ️1 … ℹ️5**. Tapping one describes that
+release in full, in its own message, without downloading anything:
+
+```
+ℹ️ 1. Космос / Space Show (2026) [BDRemux 1080p, AVC, HDR10] MKV …
+   4.5GB · ↑146 ↓12 · TrackerA
+   1080p Remux · H.264 · HDR10 · MKV · ~24000 kbps
+   Audio: DTS-HD MA 5.1 · Dub, MVO, AVO, Original · Eng
+   Subs: Rus, Eng
+   Apple TV 4K: ✅ plays (Infuse/Plex)
+   Published 2026-07-30 · 812 grab(s)
+   https://tracker-a.example.com/forum/viewtopic.php?t=111
+
+Season 2026, dual audio, forced subtitles included.
+
+📁 14 file(s) · 4.5GB
+   Сезон 1/Этап 01.mkv — 340MB
+   …
+   … and 4 more file(s)
+
+[ ⬇️ Download ]
+```
+
+The title is shown untruncated (the results list shares its space between five
+releases), the description and tracker link are whatever the indexer published,
+and the file list is read out of the .torrent itself. A magnet-only release has
+no .torrent to read, so it says the file list is unavailable and still offers
+the download — the magnet works regardless.
+
 ## Filter syntax (`/sub`, after the `|`)
 
 Comma-separated tokens, matched case-insensitively (Cyrillic included)

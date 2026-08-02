@@ -57,6 +57,8 @@ const subUsage = "Usage: /sub <query> | <filters>\n" +
 	"Example: /sub space show 2026 | rus, 1080p, x265, -720p, >1gb"
 
 const helpText = `🔍 Send any text to search for torrents; tap a result to download it.
+Tap ℹ️<number> to see that release in full first — every detail line
+untruncated, what the tracker says about it, and the list of files inside.
 A result the bot already grabbed is marked: ⬇️ downloading · ✅ downloaded.
 
 Commands:

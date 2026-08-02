@@ -5,6 +5,15 @@ the binary: after an update the bot posts the entry matching the version it is
 running, so keep entries short, plain, and headed `## v<version>` — the same
 version the git tag carries.
 
+## v1.6.0
+
+- New ℹ️ buttons under the search results: tap one to see that release in full
+  before downloading it — the untruncated title, when the tracker published it
+  and how often it was taken, its description and page link, and the list of
+  files inside the torrent with their sizes.
+- The details message carries its own ⬇️ Download button, so nothing is lost by
+  looking first.
+
 ## v1.5.0
 
 - Search results now show what you already have: ⬇️ next to a release that is

@@ -64,7 +64,11 @@ const searchJSON = `[
     "downloadUrl": "http://prowlarr:9696/1/download?apikey=k&link=def",
     "magnetUrl": "magnet:?xt=urn:btih:bbbb2222",
     "infoHash": "bbbb2222",
-    "publishDate": "2026-07-31T08:00:00Z"
+    "publishDate": "2026-07-31T08:00:00Z",
+    "infoUrl": "https://tracker-a.example.com/forum/viewtopic.php?t=111",
+    "description": "Season 2026, episode 14. Dual audio.",
+    "grabs": 812,
+    "files": 3
   },
   {
     "guid": "https://tracker-a.example.com/forum/viewtopic.php?t=333",
@@ -126,6 +130,11 @@ func TestSearchSortsAndMapsReleases(t *testing.T) {
 		DownloadURL: "http://prowlarr:9696/1/download?apikey=k&link=def",
 		MagnetURL:   "magnet:?xt=urn:btih:bbbb2222",
 		InfoHash:    "bbbb2222",
+		Description: "Season 2026, episode 14. Dual audio.",
+		InfoURL:     "https://tracker-a.example.com/forum/viewtopic.php?t=111",
+		PublishDate: time.Date(2026, 7, 31, 8, 0, 0, 0, time.UTC),
+		Grabs:       812,
+		FileCount:   3,
 	}
 	if got := releases[0]; got != want {
 		t.Errorf("release[0] = %+v, want %+v", got, want)
@@ -146,6 +155,14 @@ func TestSearchSortsAndMapsReleases(t *testing.T) {
 	// that the same as "not reported" and simply says nothing.
 	if last.Leechers != 0 {
 		t.Errorf("missing leechers = %d, want 0", last.Leechers)
+	}
+	// The detail fields are optional for every indexer: absent ones must decode
+	// as zero values, never as an error that costs the whole search.
+	if last.Description != "" || last.InfoURL != "" || last.Grabs != 0 || last.FileCount != 0 {
+		t.Errorf("release without detail fields = %+v, want them zero", last)
+	}
+	if !last.PublishDate.IsZero() {
+		t.Errorf("missing publishDate = %v, want zero", last.PublishDate)
 	}
 }
 

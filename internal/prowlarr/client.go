@@ -34,6 +34,11 @@ const searchLimit = 50
 const maxTorrentSize = 32 << 20
 
 // Release is one search result from Prowlarr's /api/v1/search endpoint.
+//
+// Everything below InfoHash is optional colour for the detail view: which
+// fields an indexer fills in varies wildly, so every one of them may be zero
+// and the display must say nothing rather than guess. The struct stays
+// comparable on purpose — tests compare whole releases.
 type Release struct {
 	GUID        string `json:"guid"`
 	Title       string `json:"title"`
@@ -44,6 +49,12 @@ type Release struct {
 	DownloadURL string `json:"downloadUrl"` // .torrent proxied through Prowlarr; may be empty
 	MagnetURL   string `json:"magnetUrl"`   // may be empty
 	InfoHash    string `json:"infoHash"`
+
+	Description string    `json:"description"` // free text from the indexer; usually short, often absent
+	InfoURL     string    `json:"infoUrl"`     // the release's page on the tracker
+	PublishDate time.Time `json:"publishDate"` // zero when the indexer reported none
+	Grabs       int       `json:"grabs"`       // how many times the tracker says it was downloaded
+	FileCount   int       `json:"files"`       // file count as the indexer reports it
 }
 
 // Client talks to a single Prowlarr instance.

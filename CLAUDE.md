@@ -45,6 +45,8 @@ Supporting packages: `internal/config` (settings file + env fallback),
 `internal/mediainfo` (pure title parser: resolution, source, codecs, audio,
 translations, subs, container, bitrate — Prowlarr publishes none of this as
 structured data, so it is read out of the release title),
+`internal/torrentmeta` (bencode reader for .torrent metainfo: name, files,
+comment — used by the details view, never for adding a torrent),
 `internal/prowlarr` + `internal/transmission` (HTTP clients), `internal/grab`
 (shared "prefer .torrent, fall back to magnet" add policy used by both the
 Telegram handler and the engine — change it in one place, not two).
@@ -268,11 +270,19 @@ TTL.
   unmarked by design.
 - **Telegram messages are chunked at 4096 chars**; unbounded replies (`/subs`,
   `/status`) would otherwise silently fail to send.
-- **The search results message cannot be chunked** — the inline keyboard is
-  attached to one message, so it must fit in a single send or a search that
-  cost minutes is lost. `resultsMessage` gives the five blocks on a page a
-  shared rune budget instead of dropping any, so the numbering keeps matching
-  the buttons. Raise `perPage` and that budget shrinks accordingly.
+- **The details view fetches the .torrent and throws it away.** `ℹ️` parses the
+  metainfo with `internal/torrentmeta` purely to list files; the bytes are not
+  cached (they can be tens of megabytes on a RAM-tight Pi) and a failed fetch is
+  the *normal* magnet-only path — it must still render the release and still
+  offer the download button, since `grab.AddRelease` falls back to the magnet.
+- **Neither the search results message nor the details message can be chunked**
+  — the inline keyboard is attached to one message, so it must fit in a single
+  send or a search that cost minutes is lost. `resultsMessage` gives the five
+  blocks on a page a shared rune budget instead of dropping any, so the
+  numbering keeps matching the buttons. Raise `perPage` and that budget shrinks
+  accordingly. `detailsMessage` budgets the same way and reserves room for the
+  "… and N more file(s)" line *before* cutting the list — a file list clipped
+  without that line claims to be the whole torrent.
 - **On Umbrel, reach services by container name** (`prowlarr_server_1:9696`,
   `transmission_server_1:9091`). `umbrel.local` is mDNS and does not resolve
   inside containers, and published ports sit behind an auth proxy that answers

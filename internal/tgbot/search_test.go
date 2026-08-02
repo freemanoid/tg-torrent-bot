@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -252,8 +253,8 @@ func TestHandleTextBuildsKeyboard(t *testing.T) {
 	}
 
 	kb := keyboardOf(t, msg.ReplyMarkup)
-	if len(kb.InlineKeyboard) != perPage+1 { // 10 results + nav row
-		t.Fatalf("keyboard has %d rows, want %d", len(kb.InlineKeyboard), perPage+1)
+	if len(kb.InlineKeyboard) != perPage+2 { // results + details row + nav row
+		t.Fatalf("keyboard has %d rows, want %d", len(kb.InlineKeyboard), perPage+2)
 	}
 
 	kind, id, n, err := decodeCallback(kb.InlineKeyboard[0][0].CallbackData)
@@ -265,7 +266,23 @@ func TestHandleTextBuildsKeyboard(t *testing.T) {
 		t.Error("search id from button is not in the cache")
 	}
 
-	nav := kb.InlineKeyboard[perPage]
+	// One details button per result, in a row of their own so they never eat
+	// the width of the result labels.
+	info := kb.InlineKeyboard[perPage]
+	if len(info) != perPage {
+		t.Fatalf("details row has %d buttons, want %d", len(info), perPage)
+	}
+	for i, btn := range info {
+		kind, _, n, err := decodeCallback(btn.CallbackData)
+		if err != nil || kind != cbInfo || n != i {
+			t.Errorf("details button %d = (%q, %d, %v), want if -> index %d", i, kind, n, err, i)
+		}
+		if !strings.Contains(btn.Text, strconv.Itoa(i+1)) {
+			t.Errorf("details button %d labelled %q, want the result number in it", i, btn.Text)
+		}
+	}
+
+	nav := kb.InlineKeyboard[perPage+1]
 	if len(nav) != 1 {
 		t.Fatalf("nav row has %d buttons, want 1 (next only on first page)", len(nav))
 	}
@@ -375,8 +392,8 @@ func TestSearchSurvivesMarkLookupFailure(t *testing.T) {
 	if strings.Contains(msg.Text, markActive) || strings.Contains(msg.Text, markDone) {
 		t.Errorf("a failed lookup must produce no markers:\n%s", msg.Text)
 	}
-	if n := len(keyboardOf(t, msg.ReplyMarkup).InlineKeyboard); n != 3 { // 3 results, no nav row
-		t.Errorf("keyboard has %d rows, want 3", n)
+	if n := len(keyboardOf(t, msg.ReplyMarkup).InlineKeyboard); n != 4 { // 3 results + details row, no nav row
+		t.Errorf("keyboard has %d rows, want 4", n)
 	}
 }
 
@@ -646,6 +663,186 @@ func TestDownloadCallbackIndexOutOfRange(t *testing.T) {
 	}
 	if len(tg.sent) != 1 {
 		t.Fatalf("sent %d messages, want 1 friendly reply", len(tg.sent))
+	}
+}
+
+// --- details callback ---
+
+// torrentFile builds a minimal multi-file .torrent, enough for the details
+// view to read a file list out of it.
+func torrentFile(name string, files ...prowlarrFile) []byte {
+	bstr := func(s string) string { return fmt.Sprintf("%d:%s", len(s), s) }
+	entries := ""
+	for _, f := range files {
+		entries += fmt.Sprintf("d6:lengthi%de4:pathl%see", f.length, bstr(f.path))
+	}
+	return []byte(fmt.Sprintf("d4:infod5:filesl%se4:name%s6:pieces4:\x00\x01\x02\x03ee", entries, bstr(name)))
+}
+
+// prowlarrFile is a file inside a fixture torrent.
+type prowlarrFile struct {
+	path   string
+	length int64
+}
+
+func TestDetailsCallbackShowsFilesAndOffersDownload(t *testing.T) {
+	releases := nReleases(2)
+	releases[1].Title = "Космос. Сезон 2026 [WEB-DL 1080p, HEVC, Rus]"
+	releases[1].InfoURL = "https://tracker-a.example.com/forum/viewtopic.php?t=111"
+	releases[1].Description = "Season 2026, dual audio."
+	releases[1].Grabs = 812
+
+	s := &fakeSearcher{releases: releases, torrent: torrentFile("Космос",
+		prowlarrFile{"Сезон 1/Этап 14.mkv", 2147483648},
+		prowlarrFile{"readme.txt", 1024},
+	)}
+	h, _ := newTestHandlers(s, &fakeTrans{})
+	tg := &fakeTG{}
+	id := h.cache.Put(cachedSearch{Query: "космос", Releases: releases})
+
+	h.HandleCallback(context.Background(), tg, callbackUpdate(encodeCallback(cbInfo, id, 1)))
+
+	if got := s.fetched; len(got) != 1 || got[0] != releases[1].DownloadURL {
+		t.Fatalf("fetched %v, want the release's download URL once", got)
+	}
+	// Reading a .torrent goes over the network: the chat must say so first.
+	if len(tg.sent) != 1 || !strings.Contains(tg.sent[0].Text, "Космос") {
+		t.Fatalf("sent %v, want one ack naming the release", tg.sent)
+	}
+	if len(tg.edited) != 1 {
+		t.Fatalf("edited %d messages, want 1 (the ack turned into details)", len(tg.edited))
+	}
+
+	text := tg.edited[0].Text
+	for _, want := range []string{
+		"2. ",                 // the result's number, so it matches the list
+		releases[1].Title,     // full title, not the clipped button label
+		"Сезон 1/Этап 14.mkv", // the file list itself
+		"readme.txt",
+		"2 file(s)",
+		"Season 2026, dual audio.", // the indexer's description
+		"812 grab(s)",
+		"https://tracker-a.example.com", // the tracker page, for everything not in the API
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("details message missing %q:\n%s", want, text)
+		}
+	}
+
+	// Nothing was downloaded — the point of the view is to decide first.
+	kb := keyboardOf(t, tg.edited[0].ReplyMarkup)
+	if len(kb.InlineKeyboard) != 1 || len(kb.InlineKeyboard[0]) != 1 {
+		t.Fatalf("details keyboard = %v, want a single download button", kb.InlineKeyboard)
+	}
+	kind, gotID, n, err := decodeCallback(kb.InlineKeyboard[0][0].CallbackData)
+	if err != nil || kind != cbDownload || gotID != id || n != 1 {
+		t.Errorf("download button = (%q, %q, %d, %v), want dl:%s:1", kind, gotID, n, err, id)
+	}
+}
+
+func TestDetailsCallbackDownloadsNothing(t *testing.T) {
+	releases := nReleases(1)
+	s := &fakeSearcher{releases: releases, torrent: torrentFile("x", prowlarrFile{"x.mkv", 1})}
+	tr := &fakeTrans{hash: "abc"}
+	h, subs := newTestHandlers(s, tr)
+	tg := &fakeTG{}
+	id := h.cache.Put(cachedSearch{Query: "q", Releases: releases})
+
+	h.HandleCallback(context.Background(), tg, callbackUpdate(encodeCallback(cbInfo, id, 0)))
+
+	if len(tr.meta) != 0 || len(tr.magnets) != 0 {
+		t.Errorf("details handed %d torrents and %d magnets to Transmission, want none", len(tr.meta), len(tr.magnets))
+	}
+	if len(subs.added) != 0 {
+		t.Errorf("details recorded %d downloads, want none", len(subs.added))
+	}
+}
+
+func TestDetailsCallbackMarksAlreadyGrabbed(t *testing.T) {
+	releases := nReleases(1)
+	releases[0].InfoHash = "AABBCC"
+	s := &fakeSearcher{releases: releases, torrent: torrentFile("x", prowlarrFile{"x.mkv", 1})}
+	h, subs := newTestHandlers(s, &fakeTrans{})
+	subs.recorded = []store.Download{{ID: 1, Hash: "aabbcc", Status: store.StatusDone}}
+	tg := &fakeTG{}
+	id := h.cache.Put(cachedSearch{Query: "q", Releases: releases})
+
+	h.HandleCallback(context.Background(), tg, callbackUpdate(encodeCallback(cbInfo, id, 0)))
+
+	if got := tg.lastEditedText(t); !strings.Contains(got, markDone) {
+		t.Errorf("details of an already-downloaded release must say so:\n%s", got)
+	}
+}
+
+func TestDetailsCallbackWithoutTorrentFile(t *testing.T) {
+	// Failing to read the .torrent is ordinary — Prowlarr answers magnet-backed
+	// downloadUrls with a redirect the fetch cannot follow — so the view must
+	// still describe the release and still offer the download.
+	tests := []struct {
+		name        string
+		release     func(*prowlarr.Release)
+		fetchErr    error
+		torrent     []byte
+		wantFetches int
+	}{
+		{
+			name:    "magnet only",
+			release: func(r *prowlarr.Release) { r.DownloadURL = ""; r.MagnetURL = "magnet:?xt=urn:btih:aa" },
+		},
+		{
+			name:        "fetch fails",
+			release:     func(r *prowlarr.Release) { r.FileCount = 7 },
+			fetchErr:    errors.New("502 bad gateway"),
+			wantFetches: 1,
+		},
+		{
+			name:        "not a torrent file",
+			release:     func(r *prowlarr.Release) {},
+			torrent:     []byte("<html>login required</html>"),
+			wantFetches: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			releases := nReleases(1)
+			tt.release(&releases[0])
+			s := &fakeSearcher{releases: releases, torrent: tt.torrent, fetchErr: tt.fetchErr}
+			h, _ := newTestHandlers(s, &fakeTrans{})
+			tg := &fakeTG{}
+			id := h.cache.Put(cachedSearch{Query: "q", Releases: releases})
+
+			h.HandleCallback(context.Background(), tg, callbackUpdate(encodeCallback(cbInfo, id, 0)))
+
+			if len(s.fetched) != tt.wantFetches {
+				t.Errorf("fetched %v, want %d attempt(s)", s.fetched, tt.wantFetches)
+			}
+			if len(tg.edited) != 1 {
+				t.Fatalf("edited %d messages, want 1", len(tg.edited))
+			}
+			text := tg.edited[0].Text
+			if !strings.Contains(text, releases[0].Title) {
+				t.Errorf("details lost the release title:\n%s", text)
+			}
+			if !strings.Contains(text, "unavailable") {
+				t.Errorf("details should say the file list is unavailable:\n%s", text)
+			}
+			if tg.edited[0].ReplyMarkup == nil {
+				t.Error("details must still offer the download: the magnet fallback works")
+			}
+		})
+	}
+}
+
+func TestDetailsCallbackStaleIndex(t *testing.T) {
+	h, _ := newTestHandlers(&fakeSearcher{}, &fakeTrans{})
+	tg := &fakeTG{}
+	id := h.cache.Put(cachedSearch{Query: "q", Releases: nReleases(2)})
+
+	h.HandleCallback(context.Background(), tg, callbackUpdate(encodeCallback(cbInfo, id, 9)))
+
+	if got := tg.lastSentText(t); !strings.Contains(got, "no longer available") {
+		t.Errorf("reply %q should say the result is gone", got)
 	}
 }
 

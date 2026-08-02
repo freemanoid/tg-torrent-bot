@@ -5,9 +5,11 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/freemanoid/tg-torrent-bot/internal/prowlarr"
+	"github.com/freemanoid/tg-torrent-bot/internal/torrentmeta"
 )
 
 func TestHumanSize(t *testing.T) {
@@ -321,6 +323,7 @@ func TestCallbackRoundTrip(t *testing.T) {
 		{cbDownload, "a1b2c3d4", 0},
 		{cbDownload, "ffffffff", 49},
 		{cbPage, "00000000", 99},
+		{cbInfo, "a1b2c3d4", 49},
 	}
 	for _, tt := range tests {
 		data := encodeCallback(tt.kind, tt.id, tt.n)
@@ -365,5 +368,149 @@ func TestResultsHeader(t *testing.T) {
 	long := resultsHeader(strings.Repeat("космос ", 100), 3, 0)
 	if n := utf8.RuneCountInString(long); n > maxHeaderQueryRunes+40 {
 		t.Errorf("header for a long query has %d runes: %q", n, long)
+	}
+}
+
+// --- details view ---
+
+func detailsRelease() prowlarr.Release {
+	return prowlarr.Release{
+		Title:       "Космос. Сезон 2026 [WEB-DL 1080p, HEVC, DTS-HD MA 5.1, Rus+Eng, Sub Rus]",
+		Size:        4831838208,
+		Seeders:     120,
+		Leechers:    12,
+		Indexer:     "TrackerB",
+		Description: "Season 2026, dual audio, forced subtitles included.",
+		InfoURL:     "https://tracker-b.example.com/forum/viewtopic.php?t=222",
+		PublishDate: time.Date(2026, 7, 30, 12, 34, 56, 0, time.UTC),
+		Grabs:       812,
+	}
+}
+
+func TestDetailsMessageShowsEverythingKnown(t *testing.T) {
+	meta := &torrentmeta.Meta{
+		Name:      "Космос",
+		Files:     []torrentmeta.File{{Path: "Сезон 1/Этап 14.mkv", Length: 4831838208}, {Path: "readme.txt", Length: 1024}},
+		TotalSize: 4831838209,
+	}
+
+	got := detailsMessage(2, detailsRelease(), markDone, meta, "")
+
+	for _, want := range []string{
+		"2. ",                           // matches the numbered result it came from
+		markDone,                        // and the state that result already showed
+		detailsRelease().Title,          // in full: this view is where nothing is clipped
+		"4.5GB · ↑120 ↓12 · TrackerB",   // size, swarm, indexer
+		"1080p WEB-DL",                  // what the title says about the media
+		"Audio: DTS-HD MA 5.1",          //
+		"Subs: Rus",                     //
+		"Published 2026-07-30",          // what the indexer says about the release
+		"812 grab(s)",                   //
+		"https://tracker-b.example.com", // the tracker page, for anything not in the API
+		"Season 2026, dual audio",       // the indexer's own description
+		"📁 2 file(s) · 4.5GB",           // and finally the file list
+		"Сезон 1/Этап 14.mkv — 4.5GB",   //
+		"readme.txt — 1KB",              //
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("details message missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestDetailsMessageOmitsWhatTheIndexerNeverSaid(t *testing.T) {
+	// Same rule as the results list: an unstated field shows nothing rather
+	// than an "unknown" placeholder or a dangling separator.
+	r := prowlarr.Release{Title: "Some Release", Seeders: 3}
+	meta := &torrentmeta.Meta{Name: "x", Files: []torrentmeta.File{{Path: "x.mkv", Length: 1}}, TotalSize: 1}
+
+	got := detailsMessage(1, r, "", meta, "")
+
+	for _, unwanted := range []string{"Published", "grab(s)", "http", "unknown", " · \n"} {
+		if strings.Contains(got, unwanted) {
+			t.Errorf("details message should not contain %q:\n%s", unwanted, got)
+		}
+	}
+}
+
+func TestDetailsMessageWithoutMetainfo(t *testing.T) {
+	r := detailsRelease()
+	r.FileCount = 7 // Prowlarr knew the count even though the .torrent was unreadable
+
+	got := detailsMessage(1, r, "", nil, "file list unavailable: magnet-only release.")
+
+	if !strings.Contains(got, "magnet-only release") {
+		t.Errorf("details message should explain the missing file list:\n%s", got)
+	}
+	if !strings.Contains(got, "7 file(s)") {
+		t.Errorf("details message should fall back to the indexer's file count:\n%s", got)
+	}
+	if !strings.Contains(got, r.Title) {
+		t.Errorf("details message lost the release title:\n%s", got)
+	}
+}
+
+func TestDetailsMessageFitsOneTelegramMessage(t *testing.T) {
+	// The details message carries the download button, so — like the results
+	// message — it cannot be split across sends: it fits or it is lost.
+	r := detailsRelease()
+	r.Title = "🎬 " + strings.Repeat("Космос Сезон ", 60) // astral emoji + long Cyrillic
+	r.Description = strings.Repeat("Подробное описание раздачи. ", 200)
+	r.InfoURL = "https://tracker-b.example.com/" + strings.Repeat("x", 300)
+
+	files := make([]torrentmeta.File, 500)
+	var total int64
+	for i := range files {
+		files[i] = torrentmeta.File{
+			Path:   strings.Repeat("Очень Длинный Каталог/", 8) + fmt.Sprintf("Этап %d 🎬.mkv", i),
+			Length: int64(i+1) << 20,
+		}
+		total += files[i].Length
+	}
+	meta := &torrentmeta.Meta{Name: "Космос", Files: files, TotalSize: total}
+
+	got := detailsMessage(3, r, markActive, meta, "")
+
+	if n := utf16Len(got); n > maxMessageUnits {
+		t.Fatalf("details message is %d UTF-16 units, over the %d budget", n, maxMessageUnits)
+	}
+	// Truncation must never eat the line that says files were left out — a
+	// silently clipped list reads as the whole torrent.
+	if !strings.Contains(got, "more file(s)") {
+		t.Errorf("a clipped file list must say how many files it dropped:\n%s", got)
+	}
+	if !strings.Contains(got, "📁 500 file(s)") {
+		t.Errorf("the file count must survive truncation:\n%s", got)
+	}
+}
+
+func TestDetailsMessageShowsEveryFileWhenItFits(t *testing.T) {
+	files := make([]torrentmeta.File, maxFileLines)
+	for i := range files {
+		files[i] = torrentmeta.File{Path: fmt.Sprintf("E%02d.mkv", i), Length: 1 << 20}
+	}
+	meta := &torrentmeta.Meta{Name: "pack", Files: files, TotalSize: int64(len(files)) << 20}
+
+	got := detailsMessage(1, prowlarr.Release{Title: "Pack"}, "", meta, "")
+
+	if strings.Contains(got, "more file(s)") {
+		t.Errorf("a complete file list must not claim files were dropped:\n%s", got)
+	}
+	for i := range files {
+		if !strings.Contains(got, files[i].Path) {
+			t.Errorf("file %s is missing:\n%s", files[i].Path, got)
+		}
+	}
+}
+
+func TestDetailsKeyboardDownloadsTheSameRelease(t *testing.T) {
+	kb := detailsKeyboard("a1b2c3d4", 7)
+
+	if len(kb.InlineKeyboard) != 1 || len(kb.InlineKeyboard[0]) != 1 {
+		t.Fatalf("details keyboard = %v, want a single button", kb.InlineKeyboard)
+	}
+	kind, id, n, err := decodeCallback(kb.InlineKeyboard[0][0].CallbackData)
+	if err != nil || kind != cbDownload || id != "a1b2c3d4" || n != 7 {
+		t.Errorf("button data = (%q, %q, %d, %v), want dl:a1b2c3d4:7", kind, id, n, err)
 	}
 }

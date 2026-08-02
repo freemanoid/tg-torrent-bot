@@ -38,6 +38,7 @@ silently.
 │  │                                             100%       │    │
 │  │                                                        │    │
 │  │            SQLite (subscriptions, seen, downloads)     │    │
+│  │            Settings page on :8542 (Umbrel app tile)    │    │
 │  └──────────┬──────────────────────────────┬──────────────┘    │
 │             │ /api/v1/search               │ RPC: add torrent, │
 │             │ + .torrent download          │ poll progress     │
@@ -49,7 +50,7 @@ silently.
 └────────────────────────────────────────────────────────────────┘
 ```
 
-One process, three long-lived loops (wired in `cmd/bot/main.go` via errgroup):
+One process, four long-lived loops (wired in `cmd/bot/main.go` via errgroup):
 
 - **Telegram long-poll loop** — handles messages, commands, and callbacks.
   Long polling means no inbound ports and no port forwarding on the home
@@ -59,6 +60,9 @@ One process, three long-lived loops (wired in `cmd/bot/main.go` via errgroup):
   notifies.
 - **Completion watcher** — polls Transmission every 30 s for downloads the bot
   added; sends exactly one "finished" message per download.
+- **Settings server** — serves the configuration form on port 8542 (see
+  [Configuration](#configuration)). Without a usable configuration it is the
+  *only* thing that runs; a failure to start never takes the other loops down.
 
 All state lives in one SQLite file (pure-Go driver, no CGO), so restarts are
 always safe: Telegram resumes via update offset, and the seen-table prevents
@@ -78,19 +82,58 @@ re-grabbing. Design details worth knowing:
 ### Package layout
 
 ```
-cmd/bot/                wiring, self-check, graceful shutdown
-internal/config/        env-var config loading + validation
+cmd/bot/                wiring, setup mode, self-check, graceful shutdown
+internal/config/        settings file + env-var loading, validation
 internal/store/         SQLite: subscriptions, seen, downloads
 internal/filter/        include/exclude/size matching
 internal/prowlarr/      Prowlarr /api/v1/search client
 internal/transmission/  thin wrapper over hekmon/transmissionrpc
 internal/subs/          subscription engine + completion watcher
 internal/tgbot/         Telegram handlers, formatting, keyboards
+internal/web/           settings page: form, save, restart-to-apply
 ```
 
 ## Configuration
 
-All configuration comes from environment variables (see `.env.example`):
+### Settings page (recommended)
+
+The bot serves its own settings page on port 8542 — on Umbrel, that is what
+the app tile opens, so configuration is a browser form, not an SSH session.
+The page has no login of its own: Umbrel's app proxy already gates it, exactly
+like every other app.
+
+1. Open the app from the Umbrel dashboard.
+2. Fill in the Telegram token, allowed chat ID, Prowlarr and Transmission
+   URLs, the Prowlarr API key, and (optionally) Transmission credentials and
+   the subscription interval.
+3. Save. The bot writes the settings and restarts to apply them; the page
+   reloads itself a few seconds later.
+
+Details worth knowing:
+
+- Settings are stored as JSON in `/data/config.json` (mode `0600`, on the same
+  persistent volume as the database), so they survive updates and restarts.
+  `CONFIG_PATH` overrides the location.
+- **A settings file wins over environment variables.** Once the page has saved
+  one, it is the only source for the values below; the environment is used
+  only when the file is absent. `DB_PATH` and `CONFIG_PATH` are the exception —
+  they are infrastructure and stay environment-only.
+- **Secrets are never echoed back.** The token, API key and password render as
+  empty password fields; leaving one blank keeps the stored value.
+- **Saving restarts the bot.** There is no hot reload: the process exits
+  non-zero and the container restart policy starts it again with the new
+  configuration. Downtime is a couple of seconds; SQLite and the Telegram
+  update offset both survive it.
+- **Nothing configured yet?** The bot starts in *setup mode*: it logs that
+  setup is needed and runs only the settings page — no Telegram loop, no
+  database — until a complete configuration is saved.
+
+### Environment variables (headless / compose)
+
+Plain-compose and other headless installs can skip the page entirely and
+configure everything up front (see `.env.example`). These are also the values
+a pre-1.1 install already has; they keep working untouched until the settings
+page saves a file.
 
 | Var | Required | Meaning |
 |---|---|---|
@@ -101,7 +144,11 @@ All configuration comes from environment variables (see `.env.example`):
 | `TRANSMISSION_URL` | yes | e.g. `http://umbrel.local:9091` |
 | `TRANSMISSION_USER` / `TRANSMISSION_PASS` | no | Only if Transmission RPC auth is enabled |
 | `DB_PATH` | no (default `/data/bot.db`) | SQLite location — point at a mounted volume in Docker |
+| `CONFIG_PATH` | no (default `/data/config.json`) | Settings file written by the page |
 | `SUB_INTERVAL` | no (default `20m`) | Subscription tick interval, Go duration syntax |
+
+Required values missing from both sources are not fatal — the bot starts in
+setup mode and waits for the form.
 
 ## Commands
 
@@ -168,7 +215,10 @@ docker compose up -d
 ```
 
 `docker-compose.yml` is written to be paste-able as a Portainer stack — it has
-no `build:` key, so the image must already exist on the host.
+no `build:` key, so the image must already exist on the host. It publishes no
+ports, because a compose install configured through `.env` never needs one; add
+a `ports: ["8542:8542"]` mapping if you want the settings page there too. Put
+it behind your own auth — the page has none of its own.
 
 ## Deployment
 
@@ -222,8 +272,9 @@ write deploy key), so the app shows an update button in the Umbrel dashboard
 with no manual steps. Plain-compose deployments update with
 `docker compose pull && docker compose up -d`.
 
-State always survives updates: the SQLite database lives on a mounted volume
-(`app-data/.../data/` on Umbrel), and `.env` is external to the image.
+State always survives updates: the SQLite database and the settings file
+(`config.json`) both live on a mounted volume (`app-data/.../data/` on Umbrel),
+and `.env` is external to the image.
 
 A `workflow_dispatch` run of the release workflow builds both platforms without
 pushing — a dry run for Dockerfile changes.

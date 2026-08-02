@@ -15,7 +15,7 @@ GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build ./cmd/bot   # Pi binary (static)
 
 ## Architecture
 
-One process, three long-lived loops wired in `cmd/bot/main.go` via errgroup:
+One process, four long-lived loops wired in `cmd/bot/main.go` via errgroup:
 
 - **Telegram long-poll loop** (`internal/tgbot`) — search, commands, inline
   keyboards, allowlist middleware (single ALLOWED_CHAT_ID; everything else is
@@ -25,9 +25,12 @@ One process, three long-lived loops wired in `cmd/bot/main.go` via errgroup:
   grabs per subscription per tick.
 - **Completion watcher** (`internal/subs/watcher.go`) — polls Transmission
   every 30 s, sends exactly one "finished" notification per download.
+- **Settings server** (`internal/web`) — settings form on :8542; saving writes
+  `/data/config.json` and restarts the process to apply it. With no usable
+  config, main starts in setup mode: this server alone, no store, no loops.
 
-Supporting packages: `internal/config` (env vars), `internal/store` (SQLite),
-`internal/filter` (release filters), `internal/prowlarr` and
+Supporting packages: `internal/config` (settings file, env fallback),
+`internal/store` (SQLite), `internal/filter` (release filters), `internal/prowlarr` and
 `internal/transmission` (HTTP clients), `internal/grab` (shared
 "prefer .torrent, fall back to magnet" add policy).
 

@@ -53,7 +53,10 @@ Supporting packages: `internal/config` (settings file, env fallback),
 
 ## Deployment
 
-Two companion plans in `docs/plans/`: `20260731-umbrel-manual-setup.md`
-(Umbrel UI steps, API keys) and `20260731-umbrel-claude-code-setup.md`
-(deploying to the Pi over SSH). This repo is local-only: never push, never
-add remotes.
+Releases are cut by pushing a `v*` tag: CI builds a multi-arch image, pushes it
+to `ghcr.io/freemanoid/tg-torrent-bot`, and auto-bumps the version and pinned
+digest in the [app store repo](https://github.com/freemanoid/umbrel-app-store),
+which is what Umbrel installs. Never edit those two files by hand.
+
+This repo is public — keep code, tests, and docs free of personal details
+(tracker names, chat IDs, host paths); the fixtures use generic placeholders.

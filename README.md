@@ -201,60 +201,54 @@ go build ./cmd/bot                                   # host binary
 GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build ./cmd/bot   # Pi binary (~10 MB, static)
 ```
 
-Docker image (multi-stage, static binary, ~10 MB final image):
+Docker image (multi-stage, static binary, ~20 MB final image). Released images
+are built by CI for `linux/amd64` and `linux/arm64`; to build one locally:
 
 ```sh
 docker build --platform linux/arm64 -t tg-torrent-bot:latest .
 ```
 
-Run with compose (reads `.env`, persists SQLite in `./data`):
-
-```sh
-cp .env.example .env   # then fill in the values
-docker compose up -d
-```
-
-`docker-compose.yml` is written to be paste-able as a Portainer stack — it has
-no `build:` key, so the image must already exist on the host. It publishes no
-ports, because a compose install configured through `.env` never needs one; add
-a `ports: ["8542:8542"]` mapping if you want the settings page there too. Put
-it behind your own auth — the page has none of its own.
-
 ## Deployment
 
-Deployment to the Umbrel Pi is covered by two companion plans:
+### Umbrel (recommended)
 
-- [`docs/plans/20260731-umbrel-manual-setup.md`](docs/plans/20260731-umbrel-manual-setup.md)
-  — one-time manual steps in the Umbrel UI: installing Prowlarr and
-  Transmission from the app store, adding indexers, collecting API keys.
-- [`docs/plans/20260731-umbrel-claude-code-setup.md`](docs/plans/20260731-umbrel-claude-code-setup.md)
-  — deploying the bot to the Pi via Claude Code over SSH, including the real
-  end-to-end smoke test against live trackers.
+Install it as an app from the community app store — this wires the settings
+page behind Umbrel's authenticating proxy and puts the bot on the same network
+as Prowlarr and Transmission:
+
+1. Install **Prowlarr** and **Transmission** from Umbrel's own app store, add
+   your indexers to Prowlarr, and copy its API key.
+2. Add `https://github.com/freemanoid/umbrel-app-store` under App Store →
+   ⋯ → Community App Stores.
+3. Install **TG Torrent Bot**, open it, and fill in the settings form.
+
+### Plain compose
+
+```sh
+docker compose up -d          # then open http://localhost:8542
+```
+
+The published image is used as-is, SQLite and the settings file persist in
+`./data`, and the settings page is bound to `127.0.0.1` — it has no
+authentication of its own, so keep it off untrusted networks.
 
 ### Reaching Prowlarr and Transmission on Umbrel
 
 Umbrel fronts each app's published port with an *app proxy* that requires a
 dashboard login, and `umbrel.local` is mDNS, which does not resolve inside a
 container. So `http://umbrel.local:9091` does **not** work for Transmission RPC
-— the proxy answers `302` and redirects to the login page.
-
-Instead the bot joins Umbrel's shared bridge network and talks to the service
-containers directly:
-
-```yaml
-# docker-compose.yml
-networks:
-  - umbrel_main_network   # declared external: true
-```
+— the proxy answers `302` and redirects to the login page. Use container names
+on Umbrel's shared bridge network instead (the app store's compose joins it for
+you):
 
 ```sh
 PROWLARR_URL=http://prowlarr_server_1:9696
 TRANSMISSION_URL=http://transmission_server_1:9091
 ```
 
-Transmission's RPC has no auth on this setup, so `TRANSMISSION_USER` /
-`TRANSMISSION_PASS` stay empty. Downloads land in `/home/umbrel/umbrel/home/Downloads`
-on the host (the external SSD).
+If Transmission's RPC has no auth, leave `TRANSMISSION_USER` /
+`TRANSMISSION_PASS` empty. Downloads land wherever the Transmission app is
+configured to put them — on Umbrel, `~/umbrel/home/Downloads`.
 
 ### Releasing
 

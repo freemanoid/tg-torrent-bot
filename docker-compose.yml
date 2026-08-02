@@ -1,33 +1,28 @@
-# tg-torrent-bot — docker compose service.
+# tg-torrent-bot — docker compose service for plain (non-Umbrel) hosts.
 #
-# Usage on the Pi (or any host):
-#   1. Build the image first:  docker build -t tg-torrent-bot:latest .
-#      (or on a dev machine:   docker build --platform linux/arm64 -t tg-torrent-bot:latest .)
-#   2. Copy .env.example to .env and fill it in.
-#   3. docker compose up -d
+#   docker compose up -d
+#   open http://localhost:8542 and fill in the settings form
 #
-# Portainer: paste this file as a Stack. Portainer stacks don't build images,
-# so the image must already exist on the host (step 1) — that's why there is
-# no `build:` key here. Environment variables can be supplied either by
-# uploading the .env file or through Portainer's environment-variables UI.
+# With no configuration the bot starts in setup mode and serves only the
+# settings page; saving writes /data/config.json and restarts to apply.
+#
+# On Umbrel, install the app from the community app store instead — it wires
+# the settings page behind Umbrel's authenticating app proxy:
+# https://github.com/freemanoid/umbrel-app-store
+#
+# Prefer configuring by environment instead of the form? Add an `env_file:
+# [.env]` line below (see .env.example); a saved settings file takes precedence.
 
 services:
   tg-torrent-bot:
-    image: tg-torrent-bot:latest
+    image: ghcr.io/freemanoid/tg-torrent-bot:latest
     container_name: tg-torrent-bot
-    env_file:
-      - .env
+    ports:
+      # Settings page. Bind to 127.0.0.1 — it has no authentication of its own,
+      # so never expose it directly to an untrusted network.
+      - "127.0.0.1:8542:8542"
     volumes:
-      # SQLite database (subscriptions, seen releases, downloads) — must
-      # persist across restarts/updates. Matches the default DB_PATH=/data/bot.db.
+      # Settings file and SQLite database (subscriptions, seen releases,
+      # downloads) — must persist across restarts and updates.
       - ./data:/data
     restart: unless-stopped
-    # Umbrel's shared app network — lets the bot reach prowlarr_server_1:9696
-    # and transmission_server_1:9091 by container name, bypassing the app
-    # proxy that fronts their published host ports.
-    networks:
-      - umbrel_main_network
-
-networks:
-  umbrel_main_network:
-    external: true

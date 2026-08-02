@@ -98,13 +98,30 @@ docker run -d -p 9091:9091 lscr.io/linuxserver/transmission
 docker run -d -p 9696:9696 lscr.io/linuxserver/prowlarr
 ```
 
-To use an existing Umbrel host's services instead, tunnel them — the app proxy
-rejects Transmission RPC on the published port, so go straight to the
-containers:
+To use an existing Umbrel host's services instead, tunnel them. Go straight to
+the containers — but by **IP, not by name**: an SSH session runs in the host's
+network namespace, where Docker's embedded DNS does not resolve, so a
+`-L …:prowlarr_server_1:9696` forward fails with `channel open failed` and
+presents on this end as a port that accepts and instantly resets.
 
 ```sh
-ssh -L 9091:transmission_server_1:9091 -L 9696:prowlarr_server_1:9696 <host>
+ssh <host> 'sudo docker inspect -f "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}" prowlarr_server_1 transmission_server_1'
+ssh -N -L 19696:<prowlarr-ip>:9696 -L 19091:<transmission-ip>:9091 <host>
 ```
+
+Do not settle for the published ports. Umbrel's auth proxy passes `/api/*` on
+an API key but `302`s everything else, so Prowlarr's health check returns `200`
+while `/download` redirects to a login page — and a client that follows
+redirects hands the bot HTML with a `200`. It surfaces as
+`bencode: unexpected byte '<'` or `invalid character '<'`, which reads like a
+tracker or parser bug and is neither. Probe before trusting a tunnel:
+Prowlarr `/1/download` must answer `401` without a key (not `302`), and
+Transmission RPC must answer `409` (its CSRF challenge).
+
+`docker` on the host needs root. If `sudo` prompts for a password, that is the
+user's to type — ask them to run it, or to grant a scoped rule
+(`umbrel ALL=(ALL) NOPASSWD: /usr/bin/docker`). Note that umbrelOS reverts
+root-filesystem changes on boot, so such a rule is not permanent.
 
 ## Cleaning up
 

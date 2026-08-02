@@ -217,9 +217,18 @@ Rules when an agent needs these:
 - Local backends are easy to stand up if the user wants them:
   `docker run -d -p 9091:9091 lscr.io/linuxserver/transmission` and
   `docker run -d -p 9696:9696 lscr.io/linuxserver/prowlarr`.
-- To use a real Umbrel host's services instead, tunnel them — the app proxy
-  rejects Transmission RPC on the published port:
-  `ssh -L 9091:transmission_server_1:9091 -L 9696:prowlarr_server_1:9696 <host>`.
+- To use a real Umbrel host's services instead, tunnel them — the app proxy is
+  not a usable substitute (see above). Tunnel to the container **IPs**, not
+  their names: an SSH session lands in the host's namespace, where Docker's
+  embedded DNS does not resolve, so a `-L …:prowlarr_server_1:9696` forward
+  fails with `channel open failed` and looks like a dead port on this end.
+  ```sh
+  ssh <host> 'sudo docker inspect -f "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}" prowlarr_server_1 transmission_server_1'
+  ssh -N -L 19696:<prowlarr-ip>:9696 -L 19091:<transmission-ip>:9091 <host>
+  ```
+  Right answers to probe for: Prowlarr `/1/download` gives `401` without a key
+  (not `302`), Transmission RPC gives `409` (its CSRF challenge, i.e. the real
+  RPC answering).
 
 ## Recipes
 
@@ -286,7 +295,12 @@ TTL.
 - **On Umbrel, reach services by container name** (`prowlarr_server_1:9696`,
   `transmission_server_1:9091`). `umbrel.local` is mDNS and does not resolve
   inside containers, and published ports sit behind an auth proxy that answers
-  `302` to Transmission RPC.
+  `302` to Transmission RPC. The proxy is **selective, which makes it a trap**:
+  it lets `/api/*` through on an API key, so a Prowlarr health check against
+  the published port returns `200` and the shortcut looks sound — while
+  `/download` `302`s to Umbrel's login page, and a client that follows
+  redirects gets HTML with a `200`. That is a `.torrent` fetch failing as
+  "unexpected byte '<'", not a tracker problem.
 - **The settings page has no authentication of its own** — Umbrel's app proxy
   provides it, and plain compose binds it to `127.0.0.1`. Never add anything to
   it that would be unsafe behind a thin proxy.

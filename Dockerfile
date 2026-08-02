@@ -14,6 +14,12 @@ FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS build
 ARG TARGETOS
 ARG TARGETARCH
 
+# VERSION is the git tag being released ("v1.4.0"); CI passes it as a build
+# arg. It is baked into the binary so the bot can announce its own update in
+# the chat. An unset VERSION leaves the binary reporting "dev", which
+# announces nothing — exactly what a local build should do.
+ARG VERSION
+
 WORKDIR /src
 
 # Cache module downloads separately from source changes.
@@ -22,7 +28,9 @@ RUN go mod download
 
 COPY . .
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
-    go build -trimpath -ldflags="-s -w" -o /out/bot ./cmd/bot
+    go build -trimpath \
+    -ldflags="-s -w -X github.com/freemanoid/tg-torrent-bot/internal/release.Version=${VERSION:-dev}" \
+    -o /out/bot ./cmd/bot
 
 # Final image: alpine for CA certificates (Telegram/Prowlarr HTTPS) and a
 # shell for occasional debugging; still ~10 MB.

@@ -19,6 +19,10 @@ It does two things:
    against a seen-table, auto-adds new matches to Transmission, and notifies
    via Telegram. Hands-off auto-downloading of recurring content.
 
+After an app update the bot posts what it is now running — the new version and
+that version's [CHANGELOG.md](CHANGELOG.md) entry — once per release, so a
+silent container restart no longer hides what arrived.
+
 Only one chat ID is allowed to talk to the bot; every other update is dropped
 silently.
 
@@ -92,6 +96,7 @@ internal/mediainfo/     release-title parsing: codecs, audio, subs, container
 internal/prowlarr/      Prowlarr /api/v1/search client
 internal/transmission/  thin wrapper over hekmon/transmissionrpc
 internal/subs/          subscription engine + completion watcher
+internal/release/       post-update announcement: version + changelog entry
 internal/tgbot/         Telegram handlers, formatting, keyboards
 internal/web/           settings page: form, save, restart-to-apply
 ```
@@ -223,6 +228,11 @@ go build ./cmd/bot                                   # host binary
 GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build ./cmd/bot   # Pi binary (~10 MB, static)
 ```
 
+A plain build reports its version as `dev` and announces nothing. Release
+builds get the tag baked in by CI (`--build-arg VERSION=v1.2.3`, injected with
+`-ldflags -X .../internal/release.Version`); pass the same build arg to
+reproduce a release image locally.
+
 Docker image (multi-stage, static binary, ~20 MB final image). Released images
 are built by CI for `linux/amd64` and `linux/arm64`; to build one locally:
 
@@ -278,6 +288,7 @@ Images are built by GitHub Actions on version tags and published to
 `ghcr.io/freemanoid/tg-torrent-bot` (multi-arch: amd64 + arm64):
 
 ```sh
+# add the release's entry to CHANGELOG.md first — the bot posts it in the chat
 git tag v1.2.3
 git push origin v1.2.3
 ```

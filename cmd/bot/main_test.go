@@ -17,6 +17,8 @@ import (
 	"github.com/go-telegram/bot"
 
 	"github.com/freemanoid/tg-torrent-bot/internal/config"
+	"github.com/freemanoid/tg-torrent-bot/internal/release"
+	"github.com/freemanoid/tg-torrent-bot/internal/store"
 )
 
 func discardLog() *slog.Logger {
@@ -156,7 +158,7 @@ func TestNewAppWiresComponents(t *testing.T) {
 	}
 	defer a.Close()
 
-	if a.st == nil || a.prowlarr == nil || a.trans == nil || a.bot == nil || a.engine == nil || a.watcher == nil {
+	if a.st == nil || a.prowlarr == nil || a.trans == nil || a.bot == nil || a.engine == nil || a.watcher == nil || a.announcer == nil {
 		t.Fatalf("newApp left components unwired: %+v", a)
 	}
 	if a.web == nil {
@@ -192,7 +194,7 @@ func TestNewAppSetupModeWiresWebOnly(t *testing.T) {
 	if !a.setupMode() {
 		t.Error("app with no config does not report setup mode")
 	}
-	if a.st != nil || a.prowlarr != nil || a.trans != nil || a.bot != nil || a.engine != nil || a.watcher != nil {
+	if a.st != nil || a.prowlarr != nil || a.trans != nil || a.bot != nil || a.engine != nil || a.watcher != nil || a.announcer != nil {
 		t.Errorf("setup mode wired bot components: %+v", a)
 	}
 	if entries, err := os.ReadDir(dbDir); err != nil {
@@ -492,5 +494,140 @@ func TestConfigPath(t *testing.T) {
 				t.Errorf("configPath() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+// --- release announcement ---
+
+// announcingBackend behaves like fakeBackend but also reports the text of
+// every Telegram message the app sends, so a test can assert on what reached
+// the chat rather than merely that a request happened.
+func announcingBackend(t *testing.T) (*httptest.Server, <-chan string) {
+	t.Helper()
+	sent := make(chan string, 8)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/getUpdates"):
+			w.Write([]byte(`{"ok":true,"result":[]}`))
+		case strings.HasSuffix(r.URL.Path, "/sendMessage"):
+			body, _ := io.ReadAll(r.Body)
+			select {
+			case sent <- string(body):
+			default:
+			}
+			w.Write([]byte(`{"ok":true,"result":{"message_id":1,"chat":{"id":42}}}`))
+		case r.URL.Path == "/api/v1/health":
+			w.Write([]byte(`[]`))
+		default:
+			w.Write([]byte(`{"ok":true,"result":true}`))
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv, sent
+}
+
+// withVersion pretends the binary was built from a released tag for the
+// duration of one test.
+func withVersion(t *testing.T, version string) {
+	t.Helper()
+	previous := release.Version
+	release.Version = version
+	t.Cleanup(func() { release.Version = previous })
+}
+
+// existingDB creates and closes a database so the app that opens it next sees
+// an upgrade of an existing install rather than a fresh one.
+func existingDB(t *testing.T, path string) {
+	t.Helper()
+	s, err := store.Open(path)
+	if err != nil {
+		t.Fatalf("pre-create database: %v", err)
+	}
+	s.Close()
+}
+
+func TestAppRunAnnouncesANewRelease(t *testing.T) {
+	withVersion(t, "v9.9.9")
+	srv, sent := announcingBackend(t)
+	cfg := testConfig(t, srv.URL)
+	existingDB(t, cfg.DBPath)
+	opts, _, _ := testOpts(t, bot.WithServerURL(srv.URL))
+	opts.log = discardLog()
+
+	a, err := newApp(cfg, opts)
+	if err != nil {
+		t.Fatalf("newApp: %v", err)
+	}
+	defer a.Close()
+	a.web.Addr = "127.0.0.1:0" // never bind the real settings port in tests
+
+	cancel, done := runInBackground(a)
+	defer cancel()
+
+	select {
+	case body := <-sent:
+		if !strings.Contains(body, "v9.9.9") {
+			t.Errorf("announcement body = %q, want the version in it", body)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no announcement reached Telegram within 5s")
+	}
+
+	// the version is recorded, so the next start stays quiet
+	awaitAnnouncedVersion(t, a.st, "v9.9.9")
+
+	cancel()
+	if err := awaitRun(t, done); err != nil {
+		t.Errorf("Run = %v, want nil", err)
+	}
+}
+
+// awaitAnnouncedVersion waits for the announcer to record what it sent.
+func awaitAnnouncedVersion(t *testing.T, st *store.Store, want string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		got, err := st.Meta(context.Background(), "announced_version")
+		if err != nil {
+			t.Fatalf("Meta: %v", err)
+		}
+		if got == want {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("announced version was not recorded as %q within 5s", want)
+}
+
+// A local build carries no version, so it must never post an announcement —
+// and an unreachable Telegram must not stop the rest of the app either.
+func TestAppRunStaysQuietWithoutAVersion(t *testing.T) {
+	withVersion(t, release.DevVersion)
+	srv, sent := announcingBackend(t)
+	cfg := testConfig(t, srv.URL)
+	existingDB(t, cfg.DBPath)
+	opts, _, _ := testOpts(t, bot.WithServerURL(srv.URL))
+	opts.log = discardLog()
+
+	a, err := newApp(cfg, opts)
+	if err != nil {
+		t.Fatalf("newApp: %v", err)
+	}
+	defer a.Close()
+	a.web.Addr = "127.0.0.1:0"
+
+	cancel, done := runInBackground(a)
+	defer cancel()
+
+	select {
+	case body := <-sent:
+		t.Errorf("unversioned build sent %q, want silence", body)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	cancel()
+	if err := awaitRun(t, done); err != nil {
+		t.Errorf("Run = %v, want nil", err)
 	}
 }

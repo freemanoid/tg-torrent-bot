@@ -52,6 +52,9 @@ type Download struct {
 // Store wraps the SQLite database.
 type Store struct {
 	db *sql.DB
+	// schemaAtOpen is the schema version the database was at before Open
+	// migrated it; 0 means the file was empty, i.e. a fresh install.
+	schemaAtOpen int
 }
 
 // dsnPragmas is appended to the database path so the driver applies these
@@ -71,16 +74,51 @@ func Open(path string) (*Store, error) {
 	// SQLITE_BUSY between writers; a single-user bot needs no more.
 	db.SetMaxOpenConns(1)
 
-	if err := migrate(db); err != nil {
+	schemaAtOpen, err := migrate(db)
+	if err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate %s: %w", path, err)
 	}
-	return &Store{db: db}, nil
+	return &Store{db: db, schemaAtOpen: schemaAtOpen}, nil
 }
 
 // Close closes the underlying database.
 func (s *Store) Close() error {
 	return s.db.Close()
+}
+
+// FreshDatabase reports whether Open created the schema from scratch, i.e.
+// this process is the first ever to use this database. It lets callers tell a
+// brand-new install apart from an upgrade of an existing one — an upgrade of a
+// database that predates a feature still reports false.
+func (s *Store) FreshDatabase() bool { return s.schemaAtOpen == 0 }
+
+// --- meta ---
+
+// Meta returns the value stored under key, or "" when the key was never set.
+// An absent key is not an error: meta holds optional bookkeeping, and every
+// caller starts out with nothing recorded.
+func (s *Store) Meta(ctx context.Context, key string) (string, error) {
+	var value string
+	err := s.db.QueryRowContext(ctx, `SELECT value FROM meta WHERE key = ?`, key).Scan(&value)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("read meta %s: %w", key, err)
+	}
+	return value, nil
+}
+
+// SetMeta stores value under key, replacing any previous value.
+func (s *Store) SetMeta(ctx context.Context, key, value string) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO meta (key, value) VALUES (?, ?)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value`, key, value)
+	if err != nil {
+		return fmt.Errorf("write meta %s: %w", key, err)
+	}
+	return nil
 }
 
 // --- subscriptions ---

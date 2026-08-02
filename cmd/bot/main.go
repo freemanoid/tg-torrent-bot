@@ -21,6 +21,7 @@ import (
 
 	"github.com/freemanoid/tg-torrent-bot/internal/config"
 	"github.com/freemanoid/tg-torrent-bot/internal/prowlarr"
+	"github.com/freemanoid/tg-torrent-bot/internal/release"
 	"github.com/freemanoid/tg-torrent-bot/internal/store"
 	"github.com/freemanoid/tg-torrent-bot/internal/subs"
 	"github.com/freemanoid/tg-torrent-bot/internal/tgbot"
@@ -43,14 +44,15 @@ const (
 // mode only web is wired: with no usable configuration there is no database
 // to open and nothing to talk to Telegram with, so the other fields are nil.
 type app struct {
-	st       *store.Store
-	prowlarr *prowlarr.Client
-	trans    *transmission.Client
-	bot      *tgbot.Bot
-	engine   *subs.Engine
-	watcher  *subs.Watcher
-	web      *web.Server
-	log      *slog.Logger
+	st        *store.Store
+	prowlarr  *prowlarr.Client
+	trans     *transmission.Client
+	bot       *tgbot.Bot
+	engine    *subs.Engine
+	watcher   *subs.Watcher
+	announcer *release.Announcer
+	web       *web.Server
+	log       *slog.Logger
 }
 
 // appOpts carries what newApp needs besides the configuration itself. store
@@ -98,14 +100,15 @@ func newApp(cfg *config.Config, o appOpts) (*app, error) {
 	}
 
 	return &app{
-		st:       st,
-		prowlarr: pr,
-		trans:    tr,
-		bot:      tb,
-		engine:   subs.NewEngine(st, pr, tr, tb, cfg.SubInterval, o.log),
-		watcher:  subs.NewWatcher(st, tr, tb, subs.DefaultWatchInterval, o.log),
-		web:      ws,
-		log:      o.log,
+		st:        st,
+		prowlarr:  pr,
+		trans:     tr,
+		bot:       tb,
+		engine:    subs.NewEngine(st, pr, tr, tb, cfg.SubInterval, o.log),
+		watcher:   subs.NewWatcher(st, tr, tb, subs.DefaultWatchInterval, o.log),
+		announcer: release.NewAnnouncer(st, tb, o.log),
+		web:       ws,
+		log:       o.log,
 	}, nil
 }
 
@@ -127,6 +130,7 @@ func (a *app) Run(ctx context.Context) error {
 	a.selfCheck(ctx)
 
 	g, ctx := errgroup.WithContext(ctx)
+	g.Go(func() error { a.announceRelease(ctx); return nil })
 	g.Go(func() error { a.bot.Run(ctx); return nil })
 	g.Go(func() error { return a.engine.Run(ctx) })
 	g.Go(func() error { return a.watcher.Run(ctx) })
@@ -155,6 +159,17 @@ func (a *app) selfCheck(ctx context.Context) {
 		a.log.Warn("transmission unreachable at startup", "error", err)
 	} else {
 		a.log.Info("transmission reachable")
+	}
+}
+
+// announceRelease tells the user, once per version, that an update landed and
+// what it brought. It runs alongside the loops rather than before them so a
+// slow or unreachable Telegram cannot hold up the bot's actual work, and like
+// every background step its failure is logged, never fatal — an announcement
+// that did not go out is retried on the next start.
+func (a *app) announceRelease(ctx context.Context) {
+	if err := a.announcer.Announce(ctx); err != nil {
+		a.log.Error("release announcement failed", "error", err)
 	}
 }
 
@@ -246,6 +261,7 @@ func run(log *slog.Logger) error {
 
 	if cfg != nil {
 		log.Info("starting",
+			"version", release.Version,
 			"prowlarr", cfg.ProwlarrURL,
 			"transmission", cfg.TransmissionURL,
 			"db", cfg.DBPath,

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -556,5 +557,120 @@ func TestConcurrentAccess(t *testing.T) {
 	active, err := s.ActiveDownloads(ctx)
 	if err != nil || len(active) != iterations {
 		t.Errorf("ActiveDownloads after concurrent writes = (%d rows, %v), want (%d, nil)", len(active), err, iterations)
+	}
+}
+
+// --- meta ---
+
+func TestMetaRoundTrip(t *testing.T) {
+	s := openMem(t)
+	ctx := context.Background()
+
+	// an unset key is not an error, it is simply empty
+	got, err := s.Meta(ctx, "announced_version")
+	if err != nil || got != "" {
+		t.Fatalf("Meta(unset) = (%q, %v), want (\"\", nil)", got, err)
+	}
+
+	if err := s.SetMeta(ctx, "announced_version", "v1.2.0"); err != nil {
+		t.Fatalf("SetMeta = %v", err)
+	}
+	if got, err = s.Meta(ctx, "announced_version"); err != nil || got != "v1.2.0" {
+		t.Fatalf("Meta after set = (%q, %v), want (\"v1.2.0\", nil)", got, err)
+	}
+
+	// a second write replaces rather than conflicting on the primary key
+	if err := s.SetMeta(ctx, "announced_version", "v1.3.0"); err != nil {
+		t.Fatalf("SetMeta overwrite = %v", err)
+	}
+	if got, err = s.Meta(ctx, "announced_version"); err != nil || got != "v1.3.0" {
+		t.Fatalf("Meta after overwrite = (%q, %v), want (\"v1.3.0\", nil)", got, err)
+	}
+}
+
+func TestMetaKeysAreIndependent(t *testing.T) {
+	s := openMem(t)
+	ctx := context.Background()
+
+	if err := s.SetMeta(ctx, "a", "1"); err != nil {
+		t.Fatalf("SetMeta(a) = %v", err)
+	}
+	if err := s.SetMeta(ctx, "b", "2"); err != nil {
+		t.Fatalf("SetMeta(b) = %v", err)
+	}
+	for key, want := range map[string]string{"a": "1", "b": "2"} {
+		got, err := s.Meta(ctx, key)
+		if err != nil || got != want {
+			t.Errorf("Meta(%q) = (%q, %v), want (%q, nil)", key, got, err, want)
+		}
+	}
+}
+
+func TestMetaFailsOnClosedStore(t *testing.T) {
+	s, err := Open(":memory:")
+	if err != nil {
+		t.Fatalf("Open = %v", err)
+	}
+	s.Close()
+	ctx := context.Background()
+
+	if _, err := s.Meta(ctx, "k"); err == nil {
+		t.Error("Meta on a closed store = nil error, want failure")
+	}
+	if err := s.SetMeta(ctx, "k", "v"); err == nil {
+		t.Error("SetMeta on a closed store = nil error, want failure")
+	}
+}
+
+func TestFreshDatabaseOnlyOnFirstOpen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bot.db")
+
+	first, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open #1 = %v", err)
+	}
+	if !first.FreshDatabase() {
+		t.Error("FreshDatabase on a new file = false, want true")
+	}
+	first.Close()
+
+	second, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open #2 = %v", err)
+	}
+	defer second.Close()
+	if second.FreshDatabase() {
+		t.Error("FreshDatabase on an existing database = true, want false")
+	}
+}
+
+// A database written by an older build — one that predates a migration — is an
+// upgrade, not a fresh install, even though the newest tables are missing.
+func TestFreshDatabaseFalseForPartiallyMigratedDatabase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bot.db")
+
+	db, err := sql.Open("sqlite", path+dsnPragmas)
+	if err != nil {
+		t.Fatalf("sql.Open = %v", err)
+	}
+	if _, err := db.Exec(migrations[0]); err != nil {
+		t.Fatalf("apply migration 1: %v", err)
+	}
+	if _, err := db.Exec("PRAGMA user_version = 1"); err != nil {
+		t.Fatalf("set user_version: %v", err)
+	}
+	db.Close()
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open = %v", err)
+	}
+	defer s.Close()
+	if s.FreshDatabase() {
+		t.Error("FreshDatabase on a pre-existing v1 database = true, want false")
+	}
+	// the pending migration still ran
+	if err := s.SetMeta(context.Background(), "k", "v"); err != nil {
+		t.Errorf("SetMeta after upgrade = %v, want the meta table to exist", err)
 	}
 }

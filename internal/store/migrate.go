@@ -39,37 +39,46 @@ CREATE TABLE downloads (
   added_at TEXT NOT NULL
 );
 `,
+	`
+CREATE TABLE meta (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+`,
 }
 
 // migrate applies any pending migrations, tracking progress in
 // PRAGMA user_version. Each migration runs in its own transaction, so a
-// failure leaves the database at the last fully-applied version.
-func migrate(db *sql.DB) error {
+// failure leaves the database at the last fully-applied version. It returns
+// the version the database was at before migrating: 0 means the file had no
+// schema at all, i.e. a brand-new install rather than an upgrade.
+func migrate(db *sql.DB) (int, error) {
 	var version int
 	if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
-		return fmt.Errorf("read schema version: %w", err)
+		return 0, fmt.Errorf("read schema version: %w", err)
 	}
 	if version > len(migrations) {
-		return fmt.Errorf("database schema version %d is newer than this binary supports (%d)", version, len(migrations))
+		return version, fmt.Errorf("database schema version %d is newer than this binary supports (%d)", version, len(migrations))
 	}
+	initial := version
 
 	for ; version < len(migrations); version++ {
 		tx, err := db.Begin()
 		if err != nil {
-			return fmt.Errorf("begin migration %d: %w", version+1, err)
+			return initial, fmt.Errorf("begin migration %d: %w", version+1, err)
 		}
 		if _, err := tx.Exec(migrations[version]); err != nil {
 			tx.Rollback()
-			return fmt.Errorf("apply migration %d: %w", version+1, err)
+			return initial, fmt.Errorf("apply migration %d: %w", version+1, err)
 		}
 		// PRAGMA does not accept bound parameters; version+1 is a trusted int.
 		if _, err := tx.Exec(fmt.Sprintf("PRAGMA user_version = %d", version+1)); err != nil {
 			tx.Rollback()
-			return fmt.Errorf("record schema version %d: %w", version+1, err)
+			return initial, fmt.Errorf("record schema version %d: %w", version+1, err)
 		}
 		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("commit migration %d: %w", version+1, err)
+			return initial, fmt.Errorf("commit migration %d: %w", version+1, err)
 		}
 	}
-	return nil
+	return initial, nil
 }

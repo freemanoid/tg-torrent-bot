@@ -36,6 +36,10 @@ One process, four loops wired in `cmd/bot/main.go` with an errgroup:
 | Completion watcher | `internal/subs/watcher.go` | Every 30 s: poll Transmission, one "finished" message per download. |
 | Settings server | `internal/web` | Config form on `:8542`; save writes config and restarts the process. |
 
+A fifth, one-shot step runs alongside them: `internal/release` posts "updated
+to vX.Y.Z" plus that version's `CHANGELOG.md` entry, once per release — see
+[Release announcement](#release-announcement).
+
 Supporting packages: `internal/config` (settings file + env fallback),
 `internal/store` (SQLite), `internal/filter` (release matching),
 `internal/mediainfo` (pure title parser: resolution, source, codecs, audio,
@@ -88,6 +92,37 @@ what prevents re-grabbing; it cascades on subscription delete.
 `prowlarr.Release{GUID, Title, Size, Seeders, Indexer, DownloadURL, MagnetURL,
 InfoHash}` — `DownloadURL`/`MagnetURL` may each be empty; `grab.AddRelease`
 handles all four combinations.
+
+The `meta` table is a plain key/value store for bookkeeping that belongs to the
+install rather than to a subscription; today it holds `announced_version`.
+
+## Release announcement
+
+An Umbrel update is a silent container restart, so the bot says so itself.
+`internal/release` compares the version baked into the binary against
+`meta.announced_version` and, when they differ, sends the version plus its
+`CHANGELOG.md` entry. Four decisions hold it together:
+
+- **The version is the git tag, not the changelog.** `release.Version` is
+  injected by the Docker build (`ARG VERSION` → `-ldflags -X`), passed by
+  `release.yml` from `github.ref_name`. A local build reports `dev` and
+  announces nothing, so development restarts never reach the chat. A docs-only
+  edit to `CHANGELOG.md` therefore cannot make a binary claim a version that
+  was never released.
+- **The changelog is embedded, not fetched.** `CHANGELOG.md` sits at the repo
+  root because that is where people look for it; `changelog.go` (package
+  `tgtorrentbot`, the only root-level Go file) exists solely because `go:embed`
+  cannot reach outside its own directory. **Every release needs its
+  `## v<version>` entry written before the tag** — a missing entry degrades to
+  the headline alone, silently.
+- **Send first, record second.** A failed send leaves `announced_version`
+  untouched and is retried on the next start; the write itself uses
+  `context.WithoutCancel` so a shutdown landing between the two does not repeat
+  the message.
+- **A fresh install records without sending.** `store.FreshDatabase()` reports
+  whether `Open` created the schema from nothing, which is what separates a new
+  install (silent) from an upgrade of a database that predates this feature
+  (announces). Do not weaken it into "no `announced_version` row yet".
 
 ## Configuration
 
@@ -252,8 +287,9 @@ key — Umbrel then offers the update. Never hand-edit those two store files.
 `ci.yml` runs vet + tests + an arm64 build check on every push and PR.
 
 **Tagging is part of shipping, not a separate request.** When a change that
-affects the running bot lands on master, cut and push the tag as the last step
-— without asking. Docs-, test- and CI-only changes are not released. Version
+affects the running bot lands on master, add the version's `CHANGELOG.md` entry
+(the bot posts it in the chat), then cut and push the tag as the last step —
+without asking. Docs-, test- and CI-only changes are not released. Version
 rules, preconditions, and the exact commands live in the `releasing` skill
 (`.claude/skills/releasing/SKILL.md`); keep the two in sync when either
 changes. A pushed tag is immutable: fix a bad release by releasing forward, not

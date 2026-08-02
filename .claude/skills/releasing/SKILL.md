@@ -42,6 +42,23 @@ Read the last tag with `git tag --sort=-v:refname | head -1` and bump from it:
 
 If the range since the last tag mixes kinds, take the largest bump in it.
 
+## Write the changelog entry first
+
+The bot posts the new version's `CHANGELOG.md` entry in the chat after the
+update lands, so the entry is part of the release, not documentation about it.
+Before tagging, add one at the top of the file:
+
+```md
+## v1.4.0
+
+- What the user can now do, in their words — not the commit subject.
+```
+
+The heading must be the tag being cut. A tag with no entry still announces, but
+with the bare headline and nothing to show for the update — the reason the
+feature exists. Commit it on master before the tag so the tagged tree contains
+it; the changelog is embedded in the binary at build time.
+
 ## Cut it
 
 Check first that master is clean, pushed, and green — `git status`,
@@ -56,6 +73,9 @@ before them:
 git tag -a v1.4.0 -m "v1.4.0: subscription pause command"
 git push origin v1.4.0
 ```
+
+CI passes the tag to the Docker build as `VERSION`, so the image knows which
+version it is and which changelog entry to announce. Nothing else sets it.
 
 Then report the run — `gh run list --workflow=release.yml --limit 1` — and say
 plainly that this is what puts the update on the Pi.

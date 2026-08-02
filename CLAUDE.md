@@ -118,6 +118,67 @@ without redesigning how the loops hold their clients.
   clients; in-memory SQLite for the store; fakes with injected error fields for
   failure paths. Synchronise with channels, never `time.Sleep`.
 
+## Testing locally
+
+Work down this ladder and stop at the lowest rung that proves the change. Only
+rung 3 needs credentials.
+
+**1. Unit tests — no credentials, use this by default.**
+
+```sh
+go test ./...            # whole suite, seconds, fully hermetic
+go test ./internal/subs -run TestTick -v
+go test -race ./internal/tgbot
+go test -cover ./...
+```
+
+Every external service is faked, so almost any behaviour can be pinned here.
+If something *cannot* be tested this way, that usually means a dependency needs
+to become a consumer-side interface — do that instead of reaching for a real
+service.
+
+**2. Run the real binary in setup mode — still no credentials.**
+
+With no usable config the process starts the settings page alone, which is
+enough to exercise the web UI, the form, validation, and the save-and-restart
+path end to end:
+
+```sh
+mkdir -p /tmp/tgbot-dev
+CONFIG_PATH=/tmp/tgbot-dev/config.json DB_PATH=/tmp/tgbot-dev/bot.db go run ./cmd/bot
+# open http://localhost:8542   (or: curl -s localhost:8542/healthz)
+```
+
+Saving the form writes `config.json` and **exits the process** — that is the
+restart-to-apply design, not a crash. Always point `CONFIG_PATH`/`DB_PATH` at a
+scratch directory outside the repo; never at a real deployment's app-data.
+
+**3. Run against real services — credentials required, so ask first.**
+
+A fake token does not work: the bot calls `getMe` at startup and exits with
+`Unauthorized`. (Tests bypass this with `WithSkipGetMe`; there is no runtime
+flag.) So a full-mode local run needs a real Telegram bot token, and Prowlarr
+and Transmission instances.
+
+Rules when an agent needs these:
+
+- **Ask the user for every credential — never invent, guess, or reuse one found
+  in a deployment.** Prompt for exactly what is needed and why.
+- **Require a separate throwaway bot** from @BotFather, never the production
+  token. Two long-pollers sharing a token fight over updates (Telegram answers
+  `409 Conflict`) and the local one would silently steal messages from the
+  deployed bot.
+- **Accept secrets as environment variables for that run only.** Never write
+  them into repo files, tests, fixtures, commit messages, or this file.
+  `.env`, `data/`, and `*.db` are gitignored — keep it that way, and prefer a
+  scratch dir outside the repo entirely.
+- Local backends are easy to stand up if the user wants them:
+  `docker run -d -p 9091:9091 lscr.io/linuxserver/transmission` and
+  `docker run -d -p 9696:9696 lscr.io/linuxserver/prowlarr`.
+- To use a real Umbrel host's services instead, tunnel them — the app proxy
+  rejects Transmission RPC on the published port:
+  `ssh -L 9091:transmission_server_1:9091 -L 9696:prowlarr_server_1:9696 <host>`.
+
 ## Recipes
 
 **Add a bot command** — `internal/tgbot/commands.go`: add a `case` in

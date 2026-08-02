@@ -28,6 +28,8 @@ RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
 # shell for occasional debugging; still ~10 MB.
 FROM alpine:3.22
 
+LABEL org.opencontainers.image.source=https://github.com/freemanoid/tg-torrent-bot
+
 RUN apk add --no-cache ca-certificates tzdata
 
 COPY --from=build /out/bot /usr/local/bin/bot

@@ -246,6 +246,11 @@ func (h *Handlers) cmdTest(ctx context.Context, api telegramAPI, args string) {
 		return
 	}
 
+	// Same slow search as a plain query, so the same ack — but left standing
+	// rather than edited: the dry-run answer below is a list that h.reply may
+	// have to split across several messages.
+	h.ackSearching(ctx, api, sub.Query)
+
 	releases, err := h.searcher.Search(ctx, sub.Query)
 	if err != nil {
 		h.reply(ctx, api, "Search failed: "+err.Error())

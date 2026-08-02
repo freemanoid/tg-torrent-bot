@@ -25,8 +25,9 @@ type fakeTG struct {
 	sent      []*bot.SendMessageParams
 	edited    []*bot.EditMessageTextParams
 	answered  []*bot.AnswerCallbackQueryParams
-	sendCalls int // every SendMessage attempt, including failed ones
-	sendErr   error
+	sendCalls int     // every SendMessage attempt, including failed ones
+	sendErr   error   // fails every SendMessage
+	sendErrs  []error // per-call overrides, consumed in order; nil = success
 	editErr   error
 }
 
@@ -34,8 +35,13 @@ func (f *fakeTG) SendMessage(_ context.Context, p *bot.SendMessageParams) (*mode
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.sendCalls++
-	if f.sendErr != nil {
-		return nil, f.sendErr
+	err := f.sendErr
+	if len(f.sendErrs) > 0 {
+		err = f.sendErrs[0]
+		f.sendErrs = f.sendErrs[1:]
+	}
+	if err != nil {
+		return nil, err
 	}
 	f.sent = append(f.sent, p)
 	return &models.Message{ID: len(f.sent)}, nil
@@ -68,6 +74,16 @@ func (f *fakeTG) lastSentText(t *testing.T) string {
 	return f.sent[len(f.sent)-1].Text
 }
 
+func (f *fakeTG) lastEditedText(t *testing.T) string {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.edited) == 0 {
+		t.Fatal("no messages edited")
+	}
+	return f.edited[len(f.edited)-1].Text
+}
+
 type fakeSearcher struct {
 	releases  []prowlarr.Release
 	searchErr error
@@ -75,9 +91,15 @@ type fakeSearcher struct {
 	fetchErr  error
 	queries   []string
 	fetched   []string
+	// onSearch runs at the start of Search, so tests can observe what the
+	// chat looked like while the (slow) search was still in flight.
+	onSearch func()
 }
 
 func (f *fakeSearcher) Search(_ context.Context, query string) ([]prowlarr.Release, error) {
+	if f.onSearch != nil {
+		f.onSearch()
+	}
 	f.queries = append(f.queries, query)
 	return f.releases, f.searchErr
 }
@@ -167,6 +189,40 @@ func keyboardOf(t *testing.T, markup models.ReplyMarkup) *models.InlineKeyboardM
 
 // --- search flow ---
 
+func TestHandleTextAcksBeforeSearching(t *testing.T) {
+	// A Prowlarr search can take minutes, so the chat must show that the bot
+	// picked the query up *before* the search runs, not after.
+	s := &fakeSearcher{releases: nReleases(3)}
+	h, _ := newTestHandlers(s, &fakeTrans{})
+	tg := &fakeTG{}
+
+	var ack *bot.SendMessageParams
+	s.onSearch = func() {
+		tg.mu.Lock()
+		defer tg.mu.Unlock()
+		if len(tg.sent) != 1 {
+			t.Errorf("sent %d messages while searching, want 1 ack", len(tg.sent))
+			return
+		}
+		ack = tg.sent[0]
+	}
+
+	h.HandleText(context.Background(), tg, textUpdate("space show"))
+
+	if ack == nil {
+		t.Fatal("no ack was sent before the search started")
+	}
+	if ack.ChatID != testChatID {
+		t.Errorf("ack ChatID = %v, want %d", ack.ChatID, testChatID)
+	}
+	if !strings.Contains(ack.Text, "space show") {
+		t.Errorf("ack %q does not name the query", ack.Text)
+	}
+	if ack.ReplyMarkup != nil {
+		t.Errorf("ack carries a %T reply markup, want none", ack.ReplyMarkup)
+	}
+}
+
 func TestHandleTextBuildsKeyboard(t *testing.T) {
 	s := &fakeSearcher{releases: nReleases(25)}
 	h, _ := newTestHandlers(s, &fakeTrans{})
@@ -178,11 +234,17 @@ func TestHandleTextBuildsKeyboard(t *testing.T) {
 		t.Fatalf("searched queries = %v, want [space show]", got)
 	}
 	if len(tg.sent) != 1 {
-		t.Fatalf("sent %d messages, want 1", len(tg.sent))
+		t.Fatalf("sent %d messages, want 1 (the ack)", len(tg.sent))
 	}
-	msg := tg.sent[0]
+	if len(tg.edited) != 1 {
+		t.Fatalf("edited %d messages, want 1 (the ack turned into results)", len(tg.edited))
+	}
+	msg := tg.edited[0]
 	if msg.ChatID != testChatID {
 		t.Errorf("ChatID = %v, want %d", msg.ChatID, testChatID)
+	}
+	if msg.MessageID != 1 {
+		t.Errorf("edited message %d, want 1 (the ack message)", msg.MessageID)
 	}
 	if !strings.Contains(msg.Text, "space show") || !strings.Contains(msg.Text, "1/3") {
 		t.Errorf("header %q missing query or page 1/3", msg.Text)
@@ -219,7 +281,7 @@ func TestHandleTextSearchErrorSurfacesIndexer(t *testing.T) {
 
 	h.HandleText(context.Background(), tg, textUpdate("dune"))
 
-	if got := tg.lastSentText(t); !strings.Contains(got, "TrackerA") {
+	if got := tg.lastEditedText(t); !strings.Contains(got, "TrackerA") {
 		t.Errorf("reply %q does not surface the failing indexer", got)
 	}
 }
@@ -230,9 +292,54 @@ func TestHandleTextNoResults(t *testing.T) {
 
 	h.HandleText(context.Background(), tg, textUpdate("nothing here"))
 
-	got := tg.lastSentText(t)
+	got := tg.lastEditedText(t)
 	if !strings.Contains(got, "No results") || !strings.Contains(got, "nothing here") {
 		t.Errorf("reply %q should say there are no results for the query", got)
+	}
+}
+
+func TestHandleTextAckSendFailureStillDelivers(t *testing.T) {
+	// The ack is a courtesy: losing it must not cost the user their results.
+	s := &fakeSearcher{releases: nReleases(25)}
+	h, _ := newTestHandlers(s, &fakeTrans{})
+	tg := &fakeTG{sendErrs: []error{errors.New("telegram hiccup")}}
+
+	h.HandleText(context.Background(), tg, textUpdate("space show"))
+
+	if len(s.queries) != 1 {
+		t.Fatalf("searched %d times, want 1 despite the failed ack", len(s.queries))
+	}
+	if len(tg.edited) != 0 {
+		t.Errorf("edited %d messages, want 0 (there is no ack to edit)", len(tg.edited))
+	}
+	if len(tg.sent) != 1 {
+		t.Fatalf("delivered %d messages, want 1 fresh results message", len(tg.sent))
+	}
+	msg := tg.sent[0]
+	if !strings.Contains(msg.Text, "1/3") {
+		t.Errorf("results header %q missing page 1/3", msg.Text)
+	}
+	if keyboardOf(t, msg.ReplyMarkup) == nil {
+		t.Error("fresh results message has no keyboard")
+	}
+}
+
+func TestHandleTextAckEditFailureFallsBackToFreshMessage(t *testing.T) {
+	s := &fakeSearcher{releases: nReleases(25)}
+	h, _ := newTestHandlers(s, &fakeTrans{})
+	tg := &fakeTG{editErr: errors.New("message to edit not found")}
+
+	h.HandleText(context.Background(), tg, textUpdate("space show"))
+
+	if len(tg.sent) != 2 {
+		t.Fatalf("sent %d messages, want 2 (ack + fresh results after the edit failed)", len(tg.sent))
+	}
+	msg := tg.sent[1]
+	if !strings.Contains(msg.Text, "1/3") {
+		t.Errorf("results header %q missing page 1/3", msg.Text)
+	}
+	if keyboardOf(t, msg.ReplyMarkup) == nil {
+		t.Error("fresh results message has no keyboard")
 	}
 }
 

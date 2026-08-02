@@ -456,6 +456,40 @@ func TestPauseCommandGenericStoreError(t *testing.T) {
 
 // --- /test (dry run) ---
 
+func TestTestCommandAcksBeforeSearching(t *testing.T) {
+	// A dry run hits the same slow Prowlarr search as a plain query, so it
+	// gets the same "I'm on it" ack — plain, not edited: the dry-run answer
+	// is a list and may be chunked across several messages.
+	subs := newFakeSubStore(store.Subscription{ID: 1, Query: "космос"})
+	s := &fakeSearcher{releases: []prowlarr.Release{
+		{GUID: "a", Title: "Космос [1080p]", Size: 4 << 30, Seeders: 12},
+	}}
+	h := newCommandHandlers(s, &fakeTrans{}, subs)
+	tg := &fakeTG{}
+
+	var sentWhileSearching int
+	s.onSearch = func() {
+		tg.mu.Lock()
+		defer tg.mu.Unlock()
+		sentWhileSearching = len(tg.sent)
+	}
+
+	command(t, h, tg, "/test 1")
+
+	if sentWhileSearching != 1 {
+		t.Fatalf("sent %d messages while searching, want 1 ack", sentWhileSearching)
+	}
+	if !strings.Contains(tg.sent[0].Text, "космос") {
+		t.Errorf("ack %q does not name the query", tg.sent[0].Text)
+	}
+	if len(tg.edited) != 0 {
+		t.Errorf("edited %d messages, want 0 (the dry-run answer is sent fresh)", len(tg.edited))
+	}
+	if got := tg.lastSentText(t); !strings.Contains(got, "Dry run") {
+		t.Errorf("last message %q should be the dry-run result", got)
+	}
+}
+
 func TestTestCommandGenericStoreError(t *testing.T) {
 	subs := newFakeSubStore(store.Subscription{ID: 1, Query: "q"})
 	subs.getErr = errors.New("database locked")

@@ -78,23 +78,63 @@ func (h *Handlers) HandleText(ctx context.Context, api telegramAPI, update *mode
 		return
 	}
 
+	ack := h.ackSearching(ctx, api, query)
+
 	releases, err := h.searcher.Search(ctx, query)
 	if err != nil {
-		h.reply(ctx, api, "Search failed: "+err.Error())
+		h.answerSearch(ctx, api, ack, "Search failed: "+err.Error(), nil)
 		return
 	}
 	if len(releases) == 0 {
-		h.reply(ctx, api, fmt.Sprintf("No results for «%s».", query))
+		h.answerSearch(ctx, api, ack, fmt.Sprintf("No results for «%s».", query), nil)
 		return
 	}
 
 	id := h.cache.Put(cachedSearch{Query: query, Releases: releases})
-	_, err = api.SendMessage(ctx, &bot.SendMessageParams{
-		ChatID:      h.chatID,
-		Text:        resultsHeader(query, len(releases), 0),
-		ReplyMarkup: resultsKeyboard(id, releases, 0),
+	h.answerSearch(ctx, api, ack,
+		resultsHeader(query, len(releases), 0),
+		resultsKeyboard(id, releases, 0))
+}
+
+// ackSearching posts a placeholder before a Prowlarr search so the chat shows
+// the query was picked up: a search regularly runs for minutes (a cold
+// FlareSolverr Cloudflare challenge alone measured ~193 s) and a silent bot
+// looks stuck. It returns the message ID to edit the answer into, or 0 when
+// the ack could not be sent — losing it must never cost the user their answer.
+func (h *Handlers) ackSearching(ctx context.Context, api telegramAPI, query string) int {
+	msg, err := api.SendMessage(ctx, &bot.SendMessageParams{
+		ChatID: h.chatID,
+		Text:   fmt.Sprintf("🔎 Searching «%s»…", query),
 	})
 	if err != nil {
+		h.log.Warn("send search ack", "error", err)
+		return 0
+	}
+	return msg.ID
+}
+
+// answerSearch turns the ack message into the final answer, falling back to a
+// fresh message when there is no ack or the edit fails. Every answer it is
+// given is a single short message, so unlike h.reply it needs no chunking —
+// the nil-keyboard path still routes through h.reply for the odd long error.
+func (h *Handlers) answerSearch(ctx context.Context, api telegramAPI, ack int, text string, kb models.ReplyMarkup) {
+	if ack != 0 {
+		_, err := api.EditMessageText(ctx, &bot.EditMessageTextParams{
+			ChatID:      h.chatID,
+			MessageID:   ack,
+			Text:        text,
+			ReplyMarkup: kb,
+		})
+		if err == nil {
+			return
+		}
+		h.log.Warn("edit search ack", "error", err)
+	}
+	if kb == nil {
+		h.reply(ctx, api, text)
+		return
+	}
+	if _, err := api.SendMessage(ctx, &bot.SendMessageParams{ChatID: h.chatID, Text: text, ReplyMarkup: kb}); err != nil {
 		h.log.Error("send search results", "error", err)
 	}
 }

@@ -1,6 +1,11 @@
 package config
 
 import (
+	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -167,5 +172,325 @@ func TestLoadBadSubInterval(t *testing.T) {
 				t.Errorf("error %q does not mention SUB_INTERVAL", err)
 			}
 		})
+	}
+}
+
+// --- file-backed config: LoadFrom / Save / ErrIncomplete ---
+
+// clearRequiredEnv blanks every required env var so tests can simulate a
+// fresh install with no environment configuration.
+func clearRequiredEnv(t *testing.T) {
+	t.Helper()
+	setRequired(t) // also blanks the optional vars
+	for _, name := range []string{
+		"TELEGRAM_TOKEN", "ALLOWED_CHAT_ID", "PROWLARR_URL",
+		"PROWLARR_API_KEY", "TRANSMISSION_URL",
+	} {
+		t.Setenv(name, "")
+	}
+}
+
+// writeConfigFile writes content to a fresh temp config path and returns it.
+func writeConfigFile(t *testing.T, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write config file: %v", err)
+	}
+	return path
+}
+
+const completeFileJSON = `{
+	"telegram_token": "654321:file-token",
+	"allowed_chat_id": 99,
+	"prowlarr_url": "http://prowlarr.local:9696",
+	"prowlarr_api_key": "file-prowlarr-key",
+	"transmission_url": "http://transmission.local:9091",
+	"transmission_user": "fuser",
+	"transmission_pass": "fpass",
+	"sub_interval": "45m"
+}`
+
+func TestLoadFromFileOverridesEnv(t *testing.T) {
+	// env is fully set with different values; the file must win for every
+	// user-config field, while DB_PATH stays env-driven.
+	setRequired(t)
+	t.Setenv("TRANSMISSION_USER", "envuser")
+	t.Setenv("TRANSMISSION_PASS", "envpass")
+	t.Setenv("SUB_INTERVAL", "1h")
+	t.Setenv("DB_PATH", "/tmp/env.db")
+	path := writeConfigFile(t, completeFileJSON)
+
+	cfg, err := LoadFrom(path)
+	if err != nil {
+		t.Fatalf("LoadFrom() returned error: %v", err)
+	}
+
+	if cfg.TelegramToken != "654321:file-token" {
+		t.Errorf("TelegramToken = %q, want file value", cfg.TelegramToken)
+	}
+	if cfg.AllowedChatID != 99 {
+		t.Errorf("AllowedChatID = %d, want 99", cfg.AllowedChatID)
+	}
+	if cfg.ProwlarrURL != "http://prowlarr.local:9696" {
+		t.Errorf("ProwlarrURL = %q, want file value", cfg.ProwlarrURL)
+	}
+	if cfg.ProwlarrAPIKey != "file-prowlarr-key" {
+		t.Errorf("ProwlarrAPIKey = %q, want file value", cfg.ProwlarrAPIKey)
+	}
+	if cfg.TransmissionURL != "http://transmission.local:9091" {
+		t.Errorf("TransmissionURL = %q, want file value", cfg.TransmissionURL)
+	}
+	if cfg.TransmissionUser != "fuser" {
+		t.Errorf("TransmissionUser = %q, want fuser", cfg.TransmissionUser)
+	}
+	if cfg.TransmissionPass != "fpass" {
+		t.Errorf("TransmissionPass = %q, want fpass", cfg.TransmissionPass)
+	}
+	if cfg.SubInterval != 45*time.Minute {
+		t.Errorf("SubInterval = %v, want 45m", cfg.SubInterval)
+	}
+	if cfg.DBPath != "/tmp/env.db" {
+		t.Errorf("DBPath = %q, want env value /tmp/env.db", cfg.DBPath)
+	}
+}
+
+func TestLoadFromFileIsSoleSource(t *testing.T) {
+	// A present file is the sole source for user-config fields: env must not
+	// fill per-field gaps. Missing optional fields get defaults, not env.
+	setRequired(t)
+	t.Setenv("TRANSMISSION_USER", "envuser")
+	t.Setenv("SUB_INTERVAL", "1h")
+	path := writeConfigFile(t, `{
+		"telegram_token": "654321:file-token",
+		"allowed_chat_id": 99,
+		"prowlarr_url": "http://prowlarr.local:9696",
+		"prowlarr_api_key": "file-prowlarr-key",
+		"transmission_url": "http://transmission.local:9091"
+	}`)
+
+	cfg, err := LoadFrom(path)
+	if err != nil {
+		t.Fatalf("LoadFrom() returned error: %v", err)
+	}
+	if cfg.SubInterval != DefaultSubInterval {
+		t.Errorf("SubInterval = %v, want default %v (not env)", cfg.SubInterval, DefaultSubInterval)
+	}
+	if cfg.TransmissionUser != "" || cfg.TransmissionPass != "" {
+		t.Errorf("Transmission credentials = %q/%q, want empty (not env)",
+			cfg.TransmissionUser, cfg.TransmissionPass)
+	}
+}
+
+func TestLoadFromFileIncomplete(t *testing.T) {
+	// Required fields missing from the file are reported as ErrIncomplete
+	// even when env could fill them: no per-field fallback.
+	setRequired(t)
+	path := writeConfigFile(t, `{
+		"telegram_token": "654321:file-token",
+		"allowed_chat_id": 99
+	}`)
+
+	_, err := LoadFrom(path)
+	var inc *ErrIncomplete
+	if !errors.As(err, &inc) {
+		t.Fatalf("LoadFrom() error = %v, want *ErrIncomplete", err)
+	}
+	want := []string{"prowlarr_url", "prowlarr_api_key", "transmission_url"}
+	if !slices.Equal(inc.Missing, want) {
+		t.Errorf("Missing = %v, want %v", inc.Missing, want)
+	}
+}
+
+func TestLoadFromFileZeroChatID(t *testing.T) {
+	// chat id 0 in the file is indistinguishable from absent — reported missing
+	setRequired(t)
+	path := writeConfigFile(t, `{
+		"telegram_token": "654321:file-token",
+		"allowed_chat_id": 0,
+		"prowlarr_url": "http://prowlarr.local:9696",
+		"prowlarr_api_key": "file-prowlarr-key",
+		"transmission_url": "http://transmission.local:9091"
+	}`)
+
+	_, err := LoadFrom(path)
+	var inc *ErrIncomplete
+	if !errors.As(err, &inc) {
+		t.Fatalf("LoadFrom() error = %v, want *ErrIncomplete", err)
+	}
+	if !slices.Contains(inc.Missing, "allowed_chat_id") {
+		t.Errorf("Missing = %v, want to contain allowed_chat_id", inc.Missing)
+	}
+}
+
+func TestLoadFromFileBadValues(t *testing.T) {
+	tests := []struct {
+		name    string
+		json    string
+		mention string
+	}{
+		{
+			name: "bad sub_interval",
+			json: `{"telegram_token":"t","allowed_chat_id":99,"prowlarr_url":"http://prowlarr.local:9696",
+				"prowlarr_api_key":"k","transmission_url":"http://transmission.local:9091","sub_interval":"soon"}`,
+			mention: "sub_interval",
+		},
+		{
+			name: "negative sub_interval",
+			json: `{"telegram_token":"t","allowed_chat_id":99,"prowlarr_url":"http://prowlarr.local:9696",
+				"prowlarr_api_key":"k","transmission_url":"http://transmission.local:9091","sub_interval":"-5m"}`,
+			mention: "sub_interval",
+		},
+		{
+			name: "bad prowlarr_url",
+			json: `{"telegram_token":"t","allowed_chat_id":99,"prowlarr_url":"not a url",
+				"prowlarr_api_key":"k","transmission_url":"http://transmission.local:9091"}`,
+			mention: "prowlarr_url",
+		},
+		{
+			name: "schemeless transmission_url",
+			json: `{"telegram_token":"t","allowed_chat_id":99,"prowlarr_url":"http://prowlarr.local:9696",
+				"prowlarr_api_key":"k","transmission_url":"transmission.local:9091"}`,
+			mention: "transmission_url",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setRequired(t)
+			path := writeConfigFile(t, tt.json)
+
+			_, err := LoadFrom(path)
+			if err == nil {
+				t.Fatalf("LoadFrom() succeeded, want error mentioning %s", tt.mention)
+			}
+			var inc *ErrIncomplete
+			if errors.As(err, &inc) {
+				t.Fatalf("LoadFrom() error = %v, want a plain validation error, not ErrIncomplete", err)
+			}
+			if !strings.Contains(err.Error(), tt.mention) {
+				t.Errorf("error %q does not mention %s", err, tt.mention)
+			}
+		})
+	}
+}
+
+func TestLoadFromMalformedFile(t *testing.T) {
+	setRequired(t)
+	path := writeConfigFile(t, `{not json`)
+
+	_, err := LoadFrom(path)
+	if err == nil {
+		t.Fatal("LoadFrom() succeeded on malformed JSON, want error")
+	}
+	var inc *ErrIncomplete
+	if errors.As(err, &inc) {
+		t.Errorf("malformed file reported as ErrIncomplete (%v), want a parse error", err)
+	}
+}
+
+func TestLoadFromEnvFallback(t *testing.T) {
+	// no file at the path → env is used exactly like Load()
+	setRequired(t)
+	t.Setenv("SUB_INTERVAL", "5m30s")
+
+	cfg, err := LoadFrom(filepath.Join(t.TempDir(), "missing.json"))
+	if err != nil {
+		t.Fatalf("LoadFrom() returned error: %v", err)
+	}
+	if cfg.TelegramToken != "123456:test-token" {
+		t.Errorf("TelegramToken = %q, want env value", cfg.TelegramToken)
+	}
+	if cfg.SubInterval != 5*time.Minute+30*time.Second {
+		t.Errorf("SubInterval = %v, want 5m30s", cfg.SubInterval)
+	}
+}
+
+func TestLoadFromUnconfigured(t *testing.T) {
+	// no file, no env → ErrIncomplete listing every required env var
+	clearRequiredEnv(t)
+
+	_, err := LoadFrom(filepath.Join(t.TempDir(), "missing.json"))
+	var inc *ErrIncomplete
+	if !errors.As(err, &inc) {
+		t.Fatalf("LoadFrom() error = %v, want *ErrIncomplete", err)
+	}
+	want := []string{
+		"TELEGRAM_TOKEN", "ALLOWED_CHAT_ID", "PROWLARR_URL",
+		"PROWLARR_API_KEY", "TRANSMISSION_URL",
+	}
+	if !slices.Equal(inc.Missing, want) {
+		t.Errorf("Missing = %v, want %v", inc.Missing, want)
+	}
+}
+
+func TestLoadIncompleteTyped(t *testing.T) {
+	// env loading reports missing vars as ErrIncomplete too, so callers can
+	// switch to setup mode with errors.As regardless of the config source
+	setRequired(t)
+	t.Setenv("TELEGRAM_TOKEN", "")
+	t.Setenv("PROWLARR_URL", "")
+
+	_, err := Load()
+	var inc *ErrIncomplete
+	if !errors.As(err, &inc) {
+		t.Fatalf("Load() error = %v, want *ErrIncomplete", err)
+	}
+	want := []string{"TELEGRAM_TOKEN", "PROWLARR_URL"}
+	if !slices.Equal(inc.Missing, want) {
+		t.Errorf("Missing = %v, want %v", inc.Missing, want)
+	}
+}
+
+func TestSaveRoundTrip(t *testing.T) {
+	// env holds different values to prove LoadFrom reads the saved file
+	setRequired(t)
+
+	saved := &Config{
+		TelegramToken:    "654321:file-token",
+		AllowedChatID:    99,
+		ProwlarrURL:      "http://prowlarr.local:9696",
+		ProwlarrAPIKey:   "file-prowlarr-key",
+		TransmissionURL:  "http://transmission.local:9091",
+		TransmissionUser: "fuser",
+		TransmissionPass: "fpass",
+		DBPath:           "/tmp/must-not-persist.db",
+		SubInterval:      45 * time.Minute,
+	}
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := saved.Save(path); err != nil {
+		t.Fatalf("Save() returned error: %v", err)
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat saved file: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("file mode = %o, want 600", perm)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read saved file: %v", err)
+	}
+	if strings.Contains(string(raw), "must-not-persist") {
+		t.Error("DBPath leaked into the config file; it is env-only infrastructure")
+	}
+	var keys map[string]any
+	if err := json.Unmarshal(raw, &keys); err != nil {
+		t.Fatalf("saved file is not valid JSON: %v", err)
+	}
+	if _, ok := keys["db_path"]; ok {
+		t.Error("saved file contains db_path key, want it omitted")
+	}
+
+	got, err := LoadFrom(path)
+	if err != nil {
+		t.Fatalf("LoadFrom() after Save() returned error: %v", err)
+	}
+	want := *saved
+	want.DBPath = DefaultDBPath // DB_PATH env is blank in this test
+	if *got != want {
+		t.Errorf("round trip mismatch:\n got %+v\nwant %+v", *got, want)
 	}
 }

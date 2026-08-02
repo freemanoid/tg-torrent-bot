@@ -216,12 +216,11 @@ git tag v1.2.3
 git push origin v1.2.3
 ```
 
-The workflow run's summary shows the pushed image digest. To roll it out:
-
-- **Umbrel (community app)**: bump `version` and the pinned image digest in the
-  [app store repo](https://github.com/freemanoid/umbrel-app-store); the app then
-  shows an update button in the Umbrel dashboard.
-- **Plain compose**: `docker compose pull && docker compose up -d`.
+The workflow then automatically bumps `version` and the pinned image digest in
+the [app store repo](https://github.com/freemanoid/umbrel-app-store) (via a
+write deploy key), so the app shows an update button in the Umbrel dashboard
+with no manual steps. Plain-compose deployments update with
+`docker compose pull && docker compose up -d`.
 
 State always survives updates: the SQLite database lives on a mounted volume
 (`app-data/.../data/` on Umbrel), and `.env` is external to the image.

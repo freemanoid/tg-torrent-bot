@@ -121,7 +121,9 @@ without redesigning how the loops hold their clients.
 ## Testing locally
 
 Work down this ladder and stop at the lowest rung that proves the change. Only
-rung 3 needs credentials.
+rung 3 needs credentials. (Claude Code picks the same workflow up automatically
+as the `local-testing` skill in `.claude/skills/`; keep the two in sync when
+either changes.)
 
 **1. Unit tests — no credentials, use this by default.**
 

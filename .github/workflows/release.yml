@@ -12,6 +12,8 @@ permissions:
 jobs:
   image:
     runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-qemu-action@v3
@@ -42,4 +44,28 @@ jobs:
         run: |
           echo "### Image pushed" >> "$GITHUB_STEP_SUMMARY"
           echo '`ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}`' >> "$GITHUB_STEP_SUMMARY"
-          echo "Pin this digest in the umbrel-app-store compose file." >> "$GITHUB_STEP_SUMMARY"
+
+  update-store:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: freemanoid/umbrel-app-store
+          ssh-key: ${{ secrets.STORE_DEPLOY_KEY }}
+      - name: bump version and digest
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          DIGEST="${{ needs.image.outputs.digest }}"
+          APP_DIR=freemanoid-tg-torrent-bot
+          sed -i "s|^version: \".*\"|version: \"$VERSION\"|" "$APP_DIR/umbrel-app.yml"
+          sed -i "s|image: ghcr.io/freemanoid/tg-torrent-bot:.*|image: ghcr.io/freemanoid/tg-torrent-bot:$VERSION@$DIGEST|" "$APP_DIR/docker-compose.yml"
+          git diff --stat
+      - name: commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "chore: tg-torrent-bot ${GITHUB_REF_NAME}"
+          git push

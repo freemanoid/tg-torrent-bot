@@ -1,62 +1,164 @@
-# tg-torrent-bot
+# tg-torrent-bot — guide for AI agents
 
-Single-binary Go Telegram bot for torrent search and subscriptions, deployed
-on an Umbrel Raspberry Pi next to Prowlarr and Transmission. See `README.md`
-for architecture and user-facing docs.
+Single-binary Go Telegram bot: search torrents through Prowlarr, download via
+Transmission, plus filter-based subscriptions that auto-grab new releases.
+Ships as an Umbrel community app; runs anywhere Docker does. ~9.5k lines
+including tests. `README.md` is the user-facing doc; this file is everything an
+agent needs to change the code safely.
 
-## Build & test
+## Build, test, run
 
 ```sh
 go test ./...        # full suite; must pass before every commit
 go vet ./...
-go build ./cmd/bot   # host binary
-GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build ./cmd/bot   # Pi binary (static)
+go build ./cmd/bot
+GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build ./cmd/bot   # Pi target, static
+docker build -t tg-torrent-bot:latest .                    # multi-stage, ~20 MB
 ```
+
+No linter beyond `go vet` is configured; keep `gofmt` clean. Tests are
+hermetic — no network, no Docker, no real Telegram; the whole suite runs in
+seconds.
 
 ## Architecture
 
-One process, four long-lived loops wired in `cmd/bot/main.go` via errgroup:
+One process, four loops wired in `cmd/bot/main.go` with an errgroup:
 
-- **Telegram long-poll loop** (`internal/tgbot`) — search, commands, inline
-  keyboards, allowlist middleware (single ALLOWED_CHAT_ID; everything else is
-  dropped silently).
-- **Subscription engine** (`internal/subs/engine.go`) — every SUB_INTERVAL:
-  search → filter → skip seen → add to Transmission → notify. Capped at 10
-  grabs per subscription per tick.
-- **Completion watcher** (`internal/subs/watcher.go`) — polls Transmission
-  every 30 s, sends exactly one "finished" notification per download.
-- **Settings server** (`internal/web`) — settings form on :8542; saving writes
-  `/data/config.json` and restarts the process to apply it. With no usable
-  config, main starts in setup mode: this server alone, no store, no loops.
+| Loop | Package | What it does |
+|---|---|---|
+| Telegram long-poll | `internal/tgbot` | Search, commands, inline keyboards. Long polling ⇒ no inbound ports. |
+| Subscription engine | `internal/subs/engine.go` | Every `SubInterval`: search → filter → skip seen → add → notify. |
+| Completion watcher | `internal/subs/watcher.go` | Every 30 s: poll Transmission, one "finished" message per download. |
+| Settings server | `internal/web` | Config form on `:8542`; save writes config and restarts the process. |
 
-Supporting packages: `internal/config` (settings file, env fallback),
-`internal/store` (SQLite), `internal/filter` (release filters), `internal/prowlarr` and
-`internal/transmission` (HTTP clients), `internal/grab` (shared
-"prefer .torrent, fall back to magnet" add policy).
+Supporting packages: `internal/config` (settings file + env fallback),
+`internal/store` (SQLite), `internal/filter` (release matching),
+`internal/prowlarr` + `internal/transmission` (HTTP clients), `internal/grab`
+(shared "prefer .torrent, fall back to magnet" add policy used by both the
+Telegram handler and the engine — change it in one place, not two).
+
+**Setup mode**: if no complete config exists, `main` starts *only* the settings
+server — no store, no clients, no loops. `newApp(nil, opts)` is that path.
+
+## Data model
+
+`store.Subscription{ID, Query, Include, Exclude, MinSizeMB, MaxSizeMB, Paused,
+Grabs, CreatedAt, LastCheckedAt}` — `Include`/`Exclude` are raw filter tokens,
+rebuilt into a `filter.Filter` by `subFilter()`.
+
+`store.Download{Hash, Title, Source, Status, AddedAt}` — `Source` is `"search"`
+or `"sub:<id>"`; `Status` is active/done. The `seen` table (`subID`+`guid`) is
+what prevents re-grabbing; it cascades on subscription delete.
+
+`prowlarr.Release{GUID, Title, Size, Seeders, Indexer, DownloadURL, MagnetURL,
+InfoHash}` — `DownloadURL`/`MagnetURL` may each be empty; `grab.AddRelease`
+handles all four combinations.
+
+## Configuration
+
+Precedence: **`/data/config.json` wins over environment variables.** When the
+file exists it is the sole source for user config; env is used only when the
+file is absent (that is how pre-1.1 installs keep working). `DB_PATH` and
+`CONFIG_PATH` are infrastructure and stay env-only.
+
+Saving from the settings page writes the file and **exits the process** so the
+container restart policy applies it. There is no hot reload — don't add one
+without redesigning how the loops hold their clients.
 
 ## Conventions
 
-- **TDD**: write tests first; every code change ships with new/updated tests
-  covering both success and error paths. All tests must pass before moving on.
-- **Interfaces at the consumer**: every external service (Telegram, Prowlarr,
-  Transmission, the store) is accessed through a narrow interface declared in
-  the consuming package and faked in its tests. No mocking frameworks.
-- **Pure Go only, no CGO**: SQLite is `modernc.org/sqlite`; cross-compiling
-  for ARM64 must stay `CGO_ENABLED=0`-clean.
-- **Migrations are append-only**: `internal/store/migrate.go` tracks schema
-  versions in `PRAGMA user_version`. Never edit a shipped migration — append
-  a new one.
-- **Per-connection SQLite pragmas ride in the DSN** (`_pragma=` query
-  parameters in `store.Open`), never via `Exec`, so reconnects keep them.
-- **Failures in background loops are logged, never fatal**; each loop retries
-  on its own schedule.
+- **TDD**: tests first, always. Every change ships with tests for success *and*
+  error paths. The suite must be green before moving to the next task.
+- **Interfaces at the consumer**: every external dependency (Telegram, Prowlarr,
+  Transmission, the store) is a narrow interface declared in the *consuming*
+  package and faked in its tests. No mocking frameworks. When a package needs a
+  new store method, extend that package's own interface and its fake.
+- **Pure Go, no CGO**: SQLite is `modernc.org/sqlite`. ARM64 cross-compilation
+  must stay `CGO_ENABLED=0`-clean — never introduce a cgo dependency.
+- **Migrations are append-only**: `internal/store/migrate.go` tracks
+  `PRAGMA user_version`; each migration runs in its own transaction. Never edit
+  a shipped entry, only append.
+- **SQLite pragmas ride in the DSN** (`_pragma=` in `store.Open`), never via
+  `Exec`, so replaced connections keep them. Pool is capped at one connection.
+- **Background failures are logged, never fatal**; each loop retries on its own
+  schedule. Only setup-mode web failure is fatal (the page *is* the app then).
+- **Test style**: table-driven where natural; `httptest` fake servers for HTTP
+  clients; in-memory SQLite for the store; fakes with injected error fields for
+  failure paths. Synchronise with channels, never `time.Sleep`.
 
-## Deployment
+## Recipes
 
-Releases are cut by pushing a `v*` tag: CI builds a multi-arch image, pushes it
-to `ghcr.io/freemanoid/tg-torrent-bot`, and auto-bumps the version and pinned
-digest in the [app store repo](https://github.com/freemanoid/umbrel-app-store),
-which is what Umbrel installs. Never edit those two files by hand.
+**Add a bot command** — `internal/tgbot/commands.go`: add a `case` in
+`handleCommand`, write the `cmdX` method, register it in `commandMenu()` and in
+`helpText`. If it needs new store access, extend `SubscriptionStore` (note: it
+deliberately excludes `seen` methods so `/test` structurally cannot mark
+releases seen) and the test fake. Tests go in `commands_test.go`.
 
-This repo is public — keep code, tests, and docs free of personal details
-(tracker names, chat IDs, host paths); the fixtures use generic placeholders.
+**Add a config field** — five files, in this order: `internal/config/config.go`
+(struct, env parse in `Load`, `Validate` if required), `internal/config/file.go`
+(json tag, `LoadFrom` + `Save` mapping), `internal/web/server.go` (`formView`
+field, template input, POST parsing; if it is a secret add a `HasX` bool and
+never render the value), `.env.example`, README config table. Tests in all
+three packages.
+
+**Add a filter token type** — `internal/filter/filter.go`: `Parse` and `Match`,
+plus `String` so the `Parse ⇄ String` round-trip test still holds. Filters are
+persisted as raw token strings, so old subscriptions must keep parsing.
+
+**Change search results / keyboards** — `internal/tgbot/search.go` (flow),
+`format.go` (labels, callback packing). Callback data is hard-capped at 64
+bytes by Telegram; the search cache maps a short ID to results with a 1 h TTL.
+
+## Nuances that bite
+
+- **Seen is marked only after Transmission confirms the add.** Keep that order —
+  a failed add must be retried next tick.
+- **Grabs are capped at 10 per subscription per tick** (`maxGrabsPerTick`) so a
+  filterless subscription trickles instead of dumping 50 torrents at once.
+- **A duplicate torrent is success**, not an error — Transmission returns the
+  existing hash. `AddDownload` reactivates a `done` row so re-downloads still
+  notify.
+- **Prowlarr timeout is 240 s** (`DefaultTimeout`) because a cold FlareSolverr
+  Cloudflare challenge measured ~193 s in practice. Don't lower it.
+- **The Prowlarr API key is sent only to the configured host** and stripped on
+  cross-host redirects; `downloadUrl` can point anywhere.
+- **Telegram messages are chunked at 4096 chars**; unbounded replies (`/subs`,
+  `/status`) would otherwise silently fail to send.
+- **On Umbrel, reach services by container name** (`prowlarr_server_1:9696`,
+  `transmission_server_1:9091`). `umbrel.local` is mDNS and does not resolve
+  inside containers, and published ports sit behind an auth proxy that answers
+  `302` to Transmission RPC.
+- **The settings page has no authentication of its own** — Umbrel's app proxy
+  provides it, and plain compose binds it to `127.0.0.1`. Never add anything to
+  it that would be unsafe behind a thin proxy.
+- **umbrelOS deletes non-app containers on boot** and reverts root-filesystem
+  changes; only app-data and `/home` persist. That is why this ships as an
+  Umbrel app rather than a standalone compose stack.
+
+## Release & deployment
+
+Push a `v*` tag. CI (`.github/workflows/release.yml`) builds a multi-arch image
+(amd64 + arm64), pushes it to `ghcr.io/freemanoid/tg-torrent-bot`, then
+auto-commits the new version and pinned digest to the
+[app store repo](https://github.com/freemanoid/umbrel-app-store) via a deploy
+key — Umbrel then offers the update. Never hand-edit those two store files.
+`ci.yml` runs vet + tests + an arm64 build check on every push and PR.
+
+## This repo is public
+
+Keep code, tests, docs, and commit messages free of personal details — no real
+tracker names, chat IDs, tokens, host paths, or use-case specifics. Fixtures use
+generic placeholders (`Космос`, `Space Show`, `TrackerA`/`TrackerB`,
+`tracker-a.example.com`); follow that style. A local `private-archive` branch
+may hold pre-sanitization history — never push it, and prefer explicit
+`git push origin <branch>` over `--all`/`--mirror`.
+
+## Known gaps (fair game to improve)
+
+- A corrupt `config.json` is fatal at startup instead of falling back to setup
+  mode, so the settings page can't be used to fix it.
+- Per-indexer failures are invisible: Prowlarr returns HTTP 200 with partial
+  results, and only whole-request failures surface an indexer name.
+- Message chunking counts runes while Telegram counts UTF-16 units, so a chunk
+  ending in astral characters could still be rejected.
+- No hot reload: every settings change costs a restart.

@@ -441,6 +441,181 @@ func TestCompleteDownloadUnknownHash(t *testing.T) {
 	}
 }
 
+func TestFindDownloads(t *testing.T) {
+	s := openMem(t)
+	ctx := context.Background()
+
+	if err := s.AddDownload(ctx, "AABBCC", "Active Release", "search"); err != nil {
+		t.Fatalf("AddDownload = %v", err)
+	}
+	if err := s.AddDownload(ctx, "DDEEFF", "Done Release", "sub:2"); err != nil {
+		t.Fatalf("AddDownload #2 = %v", err)
+	}
+	if err := s.CompleteDownload(ctx, "DDEEFF"); err != nil {
+		t.Fatalf("CompleteDownload = %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		hashes []string
+		titles []string
+		want   map[string]string // hash -> status
+	}{
+		{
+			name:   "by hash",
+			hashes: []string{"AABBCC"},
+			want:   map[string]string{"AABBCC": StatusActive},
+		},
+		{
+			// Transmission's hash casing is not guaranteed to match what a
+			// release advertised, so the lookup must ignore it.
+			name:   "by hash, different case",
+			hashes: []string{"aabbcc"},
+			want:   map[string]string{"AABBCC": StatusActive},
+		},
+		{
+			name:   "by title",
+			titles: []string{"Done Release"},
+			want:   map[string]string{"DDEEFF": StatusDone},
+		},
+		{
+			name:   "hash and title together",
+			hashes: []string{"aabbcc"},
+			titles: []string{"Done Release"},
+			want:   map[string]string{"AABBCC": StatusActive, "DDEEFF": StatusDone},
+		},
+		{
+			name:   "no match",
+			hashes: []string{"nope"},
+			titles: []string{"Never Grabbed"},
+			want:   map[string]string{},
+		},
+		{
+			name: "both lists empty",
+			want: map[string]string{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			found, err := s.FindDownloads(ctx, tt.hashes, tt.titles)
+			if err != nil {
+				t.Fatalf("FindDownloads = %v", err)
+			}
+			got := make(map[string]string, len(found))
+			for _, dl := range found {
+				got[dl.Hash] = dl.Status
+			}
+			if len(got) != len(tt.want) {
+				t.Fatalf("FindDownloads returned %+v, want %v", found, tt.want)
+			}
+			for hash, status := range tt.want {
+				if got[hash] != status {
+					t.Errorf("status of %s = %q, want %q", hash, got[hash], status)
+				}
+			}
+		})
+	}
+}
+
+func TestFindDownloadsPopulatesRow(t *testing.T) {
+	s := openMem(t)
+	ctx := context.Background()
+
+	if err := s.AddDownload(ctx, "hash-full", "Full Row", "sub:9"); err != nil {
+		t.Fatalf("AddDownload = %v", err)
+	}
+
+	found, err := s.FindDownloads(ctx, []string{"hash-full"}, nil)
+	if err != nil {
+		t.Fatalf("FindDownloads = %v", err)
+	}
+	if len(found) != 1 {
+		t.Fatalf("FindDownloads returned %d rows, want 1", len(found))
+	}
+	dl := found[0]
+	if dl.ID == 0 || dl.Title != "Full Row" || dl.Source != "sub:9" || dl.Status != StatusActive {
+		t.Errorf("row = %+v, want fully populated", dl)
+	}
+	if dl.AddedAt.IsZero() {
+		t.Error("row has zero AddedAt")
+	}
+}
+
+func TestRecentCompleted(t *testing.T) {
+	s := openMem(t)
+	ctx := context.Background()
+
+	for _, hash := range []string{"h1", "h2", "h3"} {
+		if err := s.AddDownload(ctx, hash, "Title "+hash, "search"); err != nil {
+			t.Fatalf("AddDownload %s = %v", hash, err)
+		}
+		if err := s.CompleteDownload(ctx, hash); err != nil {
+			t.Fatalf("CompleteDownload %s = %v", hash, err)
+		}
+	}
+	// An active download must never show up in the completed history.
+	if err := s.AddDownload(ctx, "h4", "Still Going", "search"); err != nil {
+		t.Fatalf("AddDownload h4 = %v", err)
+	}
+
+	done, err := s.RecentCompleted(ctx, 10)
+	if err != nil {
+		t.Fatalf("RecentCompleted = %v", err)
+	}
+	if len(done) != 3 {
+		t.Fatalf("RecentCompleted returned %d rows, want 3", len(done))
+	}
+	// newest first
+	if done[0].Hash != "h3" || done[1].Hash != "h2" || done[2].Hash != "h1" {
+		t.Errorf("RecentCompleted order = %s/%s/%s, want h3/h2/h1", done[0].Hash, done[1].Hash, done[2].Hash)
+	}
+	if done[0].Title != "Title h3" || done[0].Status != StatusDone || done[0].AddedAt.IsZero() {
+		t.Errorf("newest row = %+v, want fully populated done row", done[0])
+	}
+}
+
+func TestRecentCompletedLimit(t *testing.T) {
+	s := openMem(t)
+	ctx := context.Background()
+
+	for i := range 5 {
+		hash := fmt.Sprintf("hash-%d", i)
+		if err := s.AddDownload(ctx, hash, "Title", "search"); err != nil {
+			t.Fatalf("AddDownload = %v", err)
+		}
+		if err := s.CompleteDownload(ctx, hash); err != nil {
+			t.Fatalf("CompleteDownload = %v", err)
+		}
+	}
+
+	done, err := s.RecentCompleted(ctx, 2)
+	if err != nil {
+		t.Fatalf("RecentCompleted = %v", err)
+	}
+	if len(done) != 2 {
+		t.Fatalf("RecentCompleted(2) returned %d rows, want 2", len(done))
+	}
+	if done[0].Hash != "hash-4" || done[1].Hash != "hash-3" {
+		t.Errorf("RecentCompleted(2) = %s/%s, want the two newest", done[0].Hash, done[1].Hash)
+	}
+
+	// A non-positive limit asks for nothing and must not fall through to "all".
+	if done, err = s.RecentCompleted(ctx, 0); err != nil || len(done) != 0 {
+		t.Errorf("RecentCompleted(0) = (%d rows, %v), want (0, nil)", len(done), err)
+	}
+}
+
+func TestRecentCompletedEmpty(t *testing.T) {
+	done, err := openMem(t).RecentCompleted(context.Background(), 10)
+	if err != nil {
+		t.Fatalf("RecentCompleted = %v", err)
+	}
+	if len(done) != 0 {
+		t.Errorf("RecentCompleted on empty store = %+v, want none", done)
+	}
+}
+
 func TestOpenAppliesPragmasViaDSN(t *testing.T) {
 	// The pragmas ride in the DSN so the driver applies them to every
 	// connection it ever opens, not just the first one.

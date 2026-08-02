@@ -27,6 +27,11 @@ type SubscriptionStore interface {
 	DeleteSubscription(ctx context.Context, id int64) error
 	SetSubscriptionPaused(ctx context.Context, id int64, paused bool) error
 	ActiveDownloads(ctx context.Context) ([]store.Download, error)
+	// FindDownloads looks up what the bot already did with the given releases,
+	// matched by info hash or exact title.
+	FindDownloads(ctx context.Context, hashes, titles []string) ([]store.Download, error)
+	// RecentCompleted returns the most recently finished downloads.
+	RecentCompleted(ctx context.Context, limit int) ([]store.Download, error)
 	// AddDownload records a torrent handed to Transmission so the completion
 	// watcher can notify when it finishes.
 	AddDownload(ctx context.Context, hash, title, source string) error
@@ -37,6 +42,14 @@ var _ SubscriptionStore = (*store.Store)(nil)
 // maxDryRunLines caps how many matching releases /test lists in one message.
 const maxDryRunLines = 10
 
+// maxCompletedLines caps how much finished-download history /status shows.
+// Done rows are never deleted, so this is what keeps the command readable on a
+// phone years into an install.
+const maxCompletedLines = 10
+
+// completedFormat renders the added-at timestamp in /status history.
+const completedFormat = "2006-01-02 15:04"
+
 // lastCheckedFormat renders subscription check timestamps in /subs.
 const lastCheckedFormat = "2006-01-02 15:04"
 
@@ -44,6 +57,7 @@ const subUsage = "Usage: /sub <query> | <filters>\n" +
 	"Example: /sub space show 2026 | rus, 1080p, x265, -720p, >1gb"
 
 const helpText = `🔍 Send any text to search for torrents; tap a result to download it.
+A result the bot already grabbed is marked: ⬇️ downloading · ✅ downloaded.
 
 Commands:
 /sub <query> | <filters> — subscribe to a recurring search
@@ -281,22 +295,46 @@ func (h *Handlers) cmdTest(ctx context.Context, api telegramAPI, args string) {
 	h.reply(ctx, api, b.String())
 }
 
-// cmdStatus lists the bot's active downloads with live Transmission progress.
+// cmdStatus lists the bot's active downloads with live Transmission progress,
+// followed by what it recently finished.
 func (h *Handlers) cmdStatus(ctx context.Context, api telegramAPI) {
-	downloads, err := h.subs.ActiveDownloads(ctx)
+	active, err := h.subs.ActiveDownloads(ctx)
 	if err != nil {
 		h.reply(ctx, api, fmt.Sprintf("Failed to list downloads: %v", err))
 		return
 	}
-	if len(downloads) == 0 {
-		h.reply(ctx, api, "No active downloads.")
+	completed, err := h.subs.RecentCompleted(ctx, maxCompletedLines)
+	if err != nil {
+		h.reply(ctx, api, fmt.Sprintf("Failed to list downloads: %v", err))
+		return
+	}
+	if len(active) == 0 && len(completed) == 0 {
+		h.reply(ctx, api, "No downloads yet.")
 		return
 	}
 
+	var sections []string
+	if len(active) > 0 {
+		sections = append(sections, h.activeSection(ctx, active))
+	}
+	if len(completed) > 0 {
+		sections = append(sections, completedSection(completed))
+	}
+	h.reply(ctx, api, strings.Join(sections, "\n\n"))
+}
+
+// activeSection renders the running downloads with live Transmission progress.
+// A Transmission outage costs this section its progress figures only — the
+// history rendered beside it comes from the store and stays readable.
+func (h *Handlers) activeSection(ctx context.Context, active []store.Download) string {
 	statuses, err := h.trans.Active(ctx)
 	if err != nil {
-		h.reply(ctx, api, fmt.Sprintf("Transmission unreachable: %v", err))
-		return
+		var b strings.Builder
+		fmt.Fprintf(&b, "⬇️ Active downloads (Transmission unreachable: %v):\n", err)
+		for _, dl := range active {
+			b.WriteString("\n• " + dl.Title)
+		}
+		return b.String()
 	}
 	// Hash matching is case-insensitive, same as the completion watcher:
 	// Transmission's hash casing is not guaranteed to match what was stored.
@@ -307,7 +345,7 @@ func (h *Handlers) cmdStatus(ctx context.Context, api telegramAPI) {
 
 	var b strings.Builder
 	b.WriteString("⬇️ Active downloads:\n")
-	for _, dl := range downloads {
+	for _, dl := range active {
 		b.WriteString("\n• " + dl.Title + "\n    ")
 		st, ok := byHash[strings.ToLower(dl.Hash)]
 		switch {
@@ -320,7 +358,19 @@ func (h *Handlers) cmdStatus(ctx context.Context, api telegramAPI) {
 				progressBar(st.Percent), st.Percent*100, humanSize(st.Rate), humanETA(st.ETA))
 		}
 	}
-	h.reply(ctx, api, b.String())
+	return b.String()
+}
+
+// completedSection renders the recent history. The store records when a
+// download was added, not when it finished, so the line says so rather than
+// implying a completion time it does not have.
+func completedSection(completed []store.Download) string {
+	var b strings.Builder
+	b.WriteString("✅ Recently completed:\n")
+	for _, dl := range completed {
+		fmt.Fprintf(&b, "\n• %s — added %s", dl.Title, dl.AddedAt.UTC().Format(completedFormat))
+	}
+	return b.String()
 }
 
 // subFilter rebuilds the release filter a subscription was created with.

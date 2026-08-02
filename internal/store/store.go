@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite" // pure-Go SQLite driver
@@ -297,20 +298,74 @@ func (s *Store) ActiveDownloads(ctx context.Context) ([]Download, error) {
 	}
 	defer rows.Close()
 
-	var dls []Download
-	for rows.Next() {
-		var dl Download
-		var addedAt string
-		if err := rows.Scan(&dl.ID, &dl.Hash, &dl.Title, &dl.Source, &dl.Status, &addedAt); err != nil {
-			return nil, fmt.Errorf("list active downloads: %w", err)
-		}
-		if dl.AddedAt, err = time.Parse(timeFormat, addedAt); err != nil {
-			return nil, fmt.Errorf("list active downloads: parse added_at: %w", err)
-		}
-		dls = append(dls, dl)
-	}
-	if err := rows.Err(); err != nil {
+	dls, err := scanDownloads(rows)
+	if err != nil {
 		return nil, fmt.Errorf("list active downloads: %w", err)
+	}
+	return dls, nil
+}
+
+// FindDownloads returns the recorded downloads matching any of the given info
+// hashes (case-insensitively, because Transmission's hash casing is not
+// guaranteed to match what a release advertised) or any of the exact titles.
+// Titles are a genuine key rather than a guess: AddDownload stores the release
+// title verbatim, so anything the bot itself grabbed can be found by it even
+// when the indexer published no hash. Both lists may be empty, and finding
+// nothing is not an error.
+func (s *Store) FindDownloads(ctx context.Context, hashes, titles []string) ([]Download, error) {
+	var (
+		clauses []string
+		args    []any
+	)
+	if len(hashes) > 0 {
+		clauses = append(clauses, "lower(hash) IN ("+placeholders(len(hashes))+")")
+		for _, h := range hashes {
+			args = append(args, strings.ToLower(h))
+		}
+	}
+	if len(titles) > 0 {
+		clauses = append(clauses, "title IN ("+placeholders(len(titles))+")")
+		for _, t := range titles {
+			args = append(args, t)
+		}
+	}
+	if len(clauses) == 0 {
+		return nil, nil
+	}
+
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, hash, title, source, status, added_at
+		FROM downloads WHERE `+strings.Join(clauses, " OR ")+` ORDER BY id`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("find downloads: %w", err)
+	}
+	defer rows.Close()
+
+	dls, err := scanDownloads(rows)
+	if err != nil {
+		return nil, fmt.Errorf("find downloads: %w", err)
+	}
+	return dls, nil
+}
+
+// RecentCompleted returns at most limit finished downloads, newest first.
+// The limit is applied in SQL: done rows are never deleted, so the table grows
+// for the life of the install and must not be read into memory whole.
+func (s *Store) RecentCompleted(ctx context.Context, limit int) ([]Download, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, hash, title, source, status, added_at
+		FROM downloads WHERE status = ? ORDER BY id DESC LIMIT ?`, StatusDone, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list completed downloads: %w", err)
+	}
+	defer rows.Close()
+
+	dls, err := scanDownloads(rows)
+	if err != nil {
+		return nil, fmt.Errorf("list completed downloads: %w", err)
 	}
 	return dls, nil
 }
@@ -333,6 +388,33 @@ func (s *Store) CompleteDownload(ctx context.Context, hash string) error {
 }
 
 // --- helpers ---
+
+// scanDownloads reads a downloads result set; the column order must match the
+// SELECT lists in ActiveDownloads/FindDownloads/RecentCompleted.
+func scanDownloads(rows *sql.Rows) ([]Download, error) {
+	var dls []Download
+	for rows.Next() {
+		var dl Download
+		var addedAt string
+		if err := rows.Scan(&dl.ID, &dl.Hash, &dl.Title, &dl.Source, &dl.Status, &addedAt); err != nil {
+			return nil, err
+		}
+		var err error
+		if dl.AddedAt, err = time.Parse(timeFormat, addedAt); err != nil {
+			return nil, fmt.Errorf("parse added_at: %w", err)
+		}
+		dls = append(dls, dl)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return dls, nil
+}
+
+// placeholders builds "?, ?, …" for an IN clause of n values.
+func placeholders(n int) string {
+	return strings.TrimSuffix(strings.Repeat("?,", n), ",")
+}
 
 // scanSubscription reads one subscriptions row; the column order must match
 // the SELECT lists in GetSubscription/ListSubscriptions.

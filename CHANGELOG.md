@@ -5,6 +5,13 @@ the binary: after an update the bot posts the entry matching the version it is
 running, so keep entries short, plain, and headed `## v<version>` — the same
 version the git tag carries.
 
+## v1.5.0
+
+- Search results now show what you already have: ⬇️ next to a release that is
+  still downloading, ✅ next to one that has finished.
+- /status lists the last 10 finished downloads under the active ones, and no
+  longer goes silent when Transmission is unreachable.
+
 ## v1.4.0
 
 - The bot now announces its own updates: after an app update it posts the new

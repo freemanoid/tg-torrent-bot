@@ -69,7 +69,7 @@ func TestButtonLabel(t *testing.T) {
 		Size:     45 << 30, // 45 GiB
 		Seeders:  1200,
 		Leechers: 12,
-	})
+	}, "")
 	for _, want := range []string{"3. ", "45GB", "↑1200", "↓12", "1080p", "HEVC", "MKV"} {
 		if !strings.Contains(described, want) {
 			t.Errorf("label %q missing %q", described, want)
@@ -78,13 +78,13 @@ func TestButtonLabel(t *testing.T) {
 
 	// A title stating nothing: the label falls back to the title, which is
 	// then all that distinguishes one result from another.
-	bare := buttonLabel(1, prowlarr.Release{Title: "Short", Size: 700 << 20, Seeders: 5})
+	bare := buttonLabel(1, prowlarr.Release{Title: "Short", Size: 700 << 20, Seeders: 5}, "")
 	if bare != "1. 700MB · ↑5 · Short" {
 		t.Errorf("bare label = %q", bare)
 	}
 
 	// Playback caution reaches the button too, not only the message text.
-	caution := buttonLabel(2, prowlarr.Release{Title: "Space Show 2026 2160p WEB-DL AV1", Seeders: 3})
+	caution := buttonLabel(2, prowlarr.Release{Title: "Space Show 2026 2160p WEB-DL AV1", Seeders: 3}, "")
 	if !strings.Contains(caution, "⚠️") {
 		t.Errorf("AV1 label %q should carry a caution mark", caution)
 	}
@@ -94,7 +94,7 @@ func TestButtonLabel(t *testing.T) {
 		Title:   strings.Repeat("Космос Специальный выпуск ", 20),
 		Size:    1 << 30,
 		Seeders: 7,
-	})
+	}, "")
 	if n := utf8.RuneCountInString(long); n > maxButtonRunes {
 		t.Errorf("label has %d runes, want <= %d", n, maxButtonRunes)
 	}
@@ -110,7 +110,7 @@ func TestReleaseBlockShowsWhatTheTitleStates(t *testing.T) {
 		Seeders:  34,
 		Leechers: 5,
 		Indexer:  "TrackerA",
-	})
+	}, "")
 
 	for _, want := range []string{
 		"1. Космос / Space Show (2026)", // full title, not clipped
@@ -132,7 +132,7 @@ func TestReleaseBlockOmitsUnknownFields(t *testing.T) {
 		Size:    523 << 20,
 		Seeders: 28,
 		Indexer: "TrackerB",
-	})
+	}, "")
 
 	want := "2. Космос. Сезон 2026. Серия 5\n" + blockIndent + "523MB · ↑28 · TrackerB"
 	if block != want {
@@ -147,14 +147,14 @@ func TestReleaseBlockOmitsUnknownFields(t *testing.T) {
 func TestReleaseBlockOmitsMissingSize(t *testing.T) {
 	// Magnet-only results routinely arrive with no size. "0B" would read as
 	// an empty torrent; zero seeders is real information and stays.
-	block := releaseBlock(1, prowlarr.Release{Title: "Космос", Indexer: "TrackerB"})
+	block := releaseBlock(1, prowlarr.Release{Title: "Космос", Indexer: "TrackerB"}, "")
 	if strings.Contains(block, "0B") {
 		t.Errorf("block should omit an unreported size:\n%s", block)
 	}
 	if !strings.Contains(block, "↑0") || !strings.Contains(block, "TrackerB") {
 		t.Errorf("block lost the swarm or indexer:\n%s", block)
 	}
-	if label := buttonLabel(1, prowlarr.Release{Title: "Космос"}); strings.Contains(label, "0B") {
+	if label := buttonLabel(1, prowlarr.Release{Title: "Космос"}, ""); strings.Contains(label, "0B") {
 		t.Errorf("button label should omit an unreported size: %q", label)
 	}
 }
@@ -163,14 +163,14 @@ func TestReleaseBlockReportsPlaybackCaution(t *testing.T) {
 	block := releaseBlock(1, prowlarr.Release{
 		Title:   "Space Show 2026 2160p WEB-DL AV1 Opus",
 		Seeders: 9,
-	})
+	}, "")
 	if !strings.Contains(block, "Apple TV 4K: ⚠️") || !strings.Contains(block, "AV1") {
 		t.Errorf("block should flag AV1 playback:\n%s", block)
 	}
 }
 
 func TestReleaseBlockReportsUnnamedSubtitles(t *testing.T) {
-	block := releaseBlock(1, prowlarr.Release{Title: "Космос [BDRip 1080p, AVC] Rus + Sub", Seeders: 1})
+	block := releaseBlock(1, prowlarr.Release{Title: "Космос [BDRip 1080p, AVC] Rus + Sub", Seeders: 1}, "")
 	if !strings.Contains(block, "Subs: yes") {
 		t.Errorf("block should report subtitles of unstated language:\n%s", block)
 	}
@@ -189,7 +189,7 @@ func TestResultsMessageFitsOneSend(t *testing.T) {
 		}
 	}
 
-	msg := resultsMessage(strings.Repeat("космос ", 200), releases, 0)
+	msg := resultsMessage(strings.Repeat("космос ", 200), releases, 0, nil)
 	if n := utf16Len(msg); n > maxMessageUnits {
 		t.Errorf("message has %d UTF-16 units, want <= %d", n, maxMessageUnits)
 	}
@@ -206,7 +206,7 @@ func TestResultsMessageFitsOneSend(t *testing.T) {
 	for i := range releases {
 		releases[i].Title = strings.Repeat("🎬🚀", 900)
 	}
-	astral := resultsMessage("🎬", releases, 0)
+	astral := resultsMessage("🎬", releases, 0, nil)
 	if n := utf16Len(astral); n > maxMessageUnits {
 		t.Errorf("astral message has %d UTF-16 units, want <= %d", n, maxMessageUnits)
 	}
@@ -263,11 +263,11 @@ func TestResultsMessagePages(t *testing.T) {
 		releases[i] = prowlarr.Release{Title: fmt.Sprintf("Space Show 2026 E%02d [1080p, HEVC]", i), Seeders: i}
 	}
 
-	first := resultsMessage("space show", releases, 0)
+	first := resultsMessage("space show", releases, 0, nil)
 	if !strings.Contains(first, "E00") || strings.Contains(first, fmt.Sprintf("E%02d", perPage)) {
 		t.Errorf("page 1 shows the wrong slice:\n%s", first)
 	}
-	second := resultsMessage("space show", releases, 1)
+	second := resultsMessage("space show", releases, 1, nil)
 	if !strings.Contains(second, fmt.Sprintf("E%02d", perPage)) || strings.Contains(second, "E00") {
 		t.Errorf("page 2 shows the wrong slice:\n%s", second)
 	}
@@ -276,7 +276,7 @@ func TestResultsMessagePages(t *testing.T) {
 		t.Errorf("page 2 should number results from %d:\n%s", perPage+1, second)
 	}
 
-	if got := resultsMessage("space show", nil, 0); got != resultsHeader("space show", 0, 0) {
+	if got := resultsMessage("space show", nil, 0, nil); got != resultsHeader("space show", 0, 0) {
 		t.Errorf("empty results message = %q, want just the header", got)
 	}
 }

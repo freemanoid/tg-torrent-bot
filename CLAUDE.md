@@ -259,6 +259,13 @@ TTL.
   Cloudflare challenge measured ~193 s in practice. Don't lower it.
 - **The Prowlarr API key is sent only to the configured host** and stripped on
   cross-host redirects; `downloadUrl` can point anywhere.
+- **Download-state markers are recomputed on every render.** `pageMarks`
+  re-runs on a page flip as well as on the first answer, so state stays fresh
+  while a results message is open — never cache marks in `cachedSearch`. A
+  store failure yields no markers rather than an error: losing them must not
+  cost a search that took minutes. Only what the bot grabbed is matched (info
+  hash, then exact title), so a torrent added directly in Transmission is
+  unmarked by design.
 - **Telegram messages are chunked at 4096 chars**; unbounded replies (`/subs`,
   `/status`) would otherwise silently fail to send.
 - **The search results message cannot be chunked** — the inline keyboard is

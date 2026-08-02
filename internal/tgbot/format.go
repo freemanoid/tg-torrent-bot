@@ -7,6 +7,7 @@ import (
 
 	"github.com/freemanoid/tg-torrent-bot/internal/mediainfo"
 	"github.com/freemanoid/tg-torrent-bot/internal/prowlarr"
+	"github.com/freemanoid/tg-torrent-bot/internal/store"
 )
 
 // perPage is how many results one page shows. Each one now carries its full
@@ -31,6 +32,27 @@ const (
 	cbDownload = "dl" // n = release index within the cached search
 	cbPage     = "pg" // n = keyboard page to show
 )
+
+// Markers stating what the bot already did with a release. They reuse the
+// glyphs the add confirmation and /status already use, so download state reads
+// the same everywhere in the chat.
+const (
+	markActive = "⬇️" // handed to Transmission, still downloading
+	markDone   = "✅"  // finished
+)
+
+// statusMark renders a stored download status as its marker, and nothing for a
+// status the store never writes.
+func statusMark(status string) string {
+	switch status {
+	case store.StatusActive:
+		return markActive
+	case store.StatusDone:
+		return markDone
+	default:
+		return ""
+	}
+}
 
 // humanSize renders a byte count compactly: "45GB", "1.4GB", "700MB", "500KB".
 func humanSize(bytes int64) string {
@@ -77,24 +99,28 @@ func swarm(r prowlarr.Release) string {
 // buttonLabel renders one result button. A button label is one clipped line,
 // so it carries only what makes a tap unambiguous — the quality summary from
 // the block above it, or the title when the release said nothing about its
-// media. Everything else lives in the message text.
-func buttonLabel(n int, r prowlarr.Release) string {
+// media. Everything else lives in the message text. mark, when set, leads the
+// label: truncation eats the tail, so a prefix is the one position that always
+// survives.
+func buttonLabel(n int, r prowlarr.Release, mark string) string {
 	info := mediainfo.Parse(r.Title)
 	tail := r.Title
 	if q := joinNonEmpty(" ", info.Resolution, info.VideoCodec, info.Container, cautionMark(info)); q != "" {
 		tail = q
 	}
-	label := fmt.Sprintf("%d. %s", n, joinNonEmpty(" · ", sizeLabel(r), swarm(r), tail))
+	body := joinNonEmpty(" · ", sizeLabel(r), swarm(r), tail)
+	label := fmt.Sprintf("%d. %s", n, joinNonEmpty(" ", mark, body))
 	return truncate(label, maxButtonRunes)
 }
 
 // releaseBlock renders one numbered result as it appears in the message text:
 // the full title, then only those detail lines the title actually stated.
 // Nothing is invented — a release that names no codec simply shows no codec
-// line, which is more useful than a row of "unknown" placeholders.
-func releaseBlock(n int, r prowlarr.Release) string {
+// line, which is more useful than a row of "unknown" placeholders. mark, when
+// set, leads the title line so it survives the block's rune budget.
+func releaseBlock(n int, r prowlarr.Release, mark string) string {
 	info := mediainfo.Parse(r.Title)
-	lines := []string{fmt.Sprintf("%d. %s", n, r.Title)}
+	lines := []string{fmt.Sprintf("%d. %s", n, joinNonEmpty(" ", mark, r.Title))}
 	add := func(s string) {
 		if s != "" {
 			lines = append(lines, blockIndent+s)
@@ -272,7 +298,10 @@ func resultsHeader(query string, total, page int) string {
 // fails and a search that may have taken minutes is lost. Blocks therefore
 // share a rune budget rather than being dropped: keeping every block keeps the
 // numbering aligned with the buttons even when a title is pathologically long.
-func resultsMessage(query string, releases []prowlarr.Release, page int) string {
+//
+// marks carries the download-state marker per release index, and may be nil —
+// a lookup that failed simply renders the results the way it always did.
+func resultsMessage(query string, releases []prowlarr.Release, page int, marks map[int]string) string {
 	page = clampPage(len(releases), page)
 	start, end := pageBounds(len(releases), page)
 	header := resultsHeader(query, len(releases), page)
@@ -287,7 +316,7 @@ func resultsMessage(query string, releases []prowlarr.Release, page int) string 
 	parts := make([]string, 0, shown+1)
 	parts = append(parts, header)
 	for i := start; i < end; i++ {
-		parts = append(parts, truncateUnits(releaseBlock(i+1, releases[i]), budget))
+		parts = append(parts, truncateUnits(releaseBlock(i+1, releases[i], marks[i]), budget))
 	}
 	return strings.Join(parts, "\n\n")
 }

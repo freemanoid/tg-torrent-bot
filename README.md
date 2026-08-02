@@ -168,7 +168,7 @@ setup mode and waits for the form.
 | `/unsub <id>` | Remove a subscription |
 | `/pause <id>` | Pause or resume a subscription |
 | `/test <id>` | Dry-run: show what WOULD match right now, download nothing |
-| `/status` | Active downloads with progress bars |
+| `/status` | Active downloads with progress bars, plus recently completed ones |
 | `/help` | Usage summary |
 | `/start` | Same as `/help` |
 
@@ -187,6 +187,12 @@ Each result is listed like this:
    Subs: Rus, Eng
    Apple TV 4K: ✅ plays (Infuse/Plex)
 ```
+
+A result the bot has already handed to Transmission is marked in front of its
+title, on both the text and the button: **⬇️** while it is still downloading,
+**✅** once it has finished. Matching is by info hash, falling back to the exact
+release title for indexers that publish no hash — so only what the bot itself
+grabbed is marked, not torrents added directly in Transmission.
 
 Everything below the size line is read out of the release title itself —
 Prowlarr publishes no structured media metadata — so a line is shown only when

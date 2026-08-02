@@ -13,6 +13,7 @@ import (
 	"github.com/go-telegram/bot/models"
 
 	"github.com/freemanoid/tg-torrent-bot/internal/prowlarr"
+	"github.com/freemanoid/tg-torrent-bot/internal/store"
 	"github.com/freemanoid/tg-torrent-bot/internal/transmission"
 )
 
@@ -271,6 +272,111 @@ func TestHandleTextBuildsKeyboard(t *testing.T) {
 	kind, _, n, err = decodeCallback(nav[0].CallbackData)
 	if err != nil || kind != cbPage || n != 1 {
 		t.Errorf("nav button = (%q, %d, %v), want pg -> page 1", kind, n, err)
+	}
+}
+
+// --- download-state markers ---
+
+func TestSearchMarksAlreadyGrabbedReleases(t *testing.T) {
+	releases := nReleases(3)
+	releases[0].InfoHash = "AABBCC" // matched by hash, in a different casing
+	releases[1].InfoHash = ""       // no hash published: matched by title
+
+	s := &fakeSearcher{releases: releases}
+	h, subs := newTestHandlers(s, &fakeTrans{})
+	subs.recorded = []store.Download{
+		{ID: 1, Hash: "aabbcc", Title: "Something Else Entirely", Status: store.StatusActive},
+		{ID: 2, Hash: "ddeeff", Title: releases[1].Title, Status: store.StatusDone},
+	}
+	tg := &fakeTG{}
+
+	h.HandleText(context.Background(), tg, textUpdate("space show"))
+
+	msg := tg.edited[0]
+	if !strings.Contains(msg.Text, "1. "+markActive) {
+		t.Errorf("result 1 should be marked as downloading:\n%s", msg.Text)
+	}
+	if !strings.Contains(msg.Text, "2. "+markDone) {
+		t.Errorf("result 2 should be marked as downloaded:\n%s", msg.Text)
+	}
+	if strings.Contains(msg.Text, "3. "+markActive) || strings.Contains(msg.Text, "3. "+markDone) {
+		t.Errorf("result 3 was never grabbed and must carry no marker:\n%s", msg.Text)
+	}
+
+	// The marker reaches the buttons too — that is where the tap happens.
+	kb := keyboardOf(t, msg.ReplyMarkup)
+	if !strings.Contains(kb.InlineKeyboard[0][0].Text, markActive) {
+		t.Errorf("button 1 = %q, want the downloading marker", kb.InlineKeyboard[0][0].Text)
+	}
+	if !strings.Contains(kb.InlineKeyboard[1][0].Text, markDone) {
+		t.Errorf("button 2 = %q, want the downloaded marker", kb.InlineKeyboard[1][0].Text)
+	}
+}
+
+func TestSearchLooksUpOnlyThePagesReleases(t *testing.T) {
+	// The lookup must stay bounded by the page, not by the size of the result
+	// set — a search can return hundreds of releases.
+	s := &fakeSearcher{releases: nReleases(3 * perPage)}
+	h, subs := newTestHandlers(s, &fakeTrans{})
+	tg := &fakeTG{}
+
+	h.HandleText(context.Background(), tg, textUpdate("space show"))
+
+	if len(subs.findTitles) != perPage {
+		t.Errorf("looked up %d titles, want %d (one page)", len(subs.findTitles), perPage)
+	}
+}
+
+func TestPageFlipRecomputesMarks(t *testing.T) {
+	// Marks are not cached with the search: a page flip re-renders the whole
+	// message, and a torrent that finished meanwhile must show its new state.
+	releases := nReleases(perPage + 2)
+	s := &fakeSearcher{releases: releases}
+	h, subs := newTestHandlers(s, &fakeTrans{})
+	tg := &fakeTG{}
+
+	h.HandleText(context.Background(), tg, textUpdate("space show"))
+	_, id, _, err := decodeCallback(keyboardOf(t, tg.edited[0].ReplyMarkup).InlineKeyboard[0][0].CallbackData)
+	if err != nil {
+		t.Fatalf("decodeCallback = %v", err)
+	}
+
+	// Only a release on page 2 is recorded, and only after the first render.
+	subs.recorded = []store.Download{
+		{ID: 1, Hash: "zzz", Title: releases[perPage].Title, Status: store.StatusDone},
+	}
+	h.HandleCallback(context.Background(), tg, callbackUpdate(encodeCallback(cbPage, id, 1)))
+
+	flipped := tg.edited[len(tg.edited)-1]
+	if !strings.Contains(flipped.Text, fmt.Sprintf("%d. %s", perPage+1, markDone)) {
+		t.Errorf("page 2 should mark the finished release:\n%s", flipped.Text)
+	}
+	if !strings.Contains(keyboardOf(t, flipped.ReplyMarkup).InlineKeyboard[0][0].Text, markDone) {
+		t.Error("page 2's first button lost the marker")
+	}
+}
+
+func TestSearchSurvivesMarkLookupFailure(t *testing.T) {
+	// A search can cost minutes; losing the markers must never cost the answer.
+	s := &fakeSearcher{releases: nReleases(3)}
+	h, subs := newTestHandlers(s, &fakeTrans{})
+	subs.findErr = errors.New("database locked")
+	tg := &fakeTG{}
+
+	h.HandleText(context.Background(), tg, textUpdate("space show"))
+
+	if len(tg.edited) != 1 {
+		t.Fatalf("edited %d messages, want 1 (the results)", len(tg.edited))
+	}
+	msg := tg.edited[0]
+	if !strings.Contains(msg.Text, "1. Release 0") {
+		t.Errorf("results should render unmarked:\n%s", msg.Text)
+	}
+	if strings.Contains(msg.Text, markActive) || strings.Contains(msg.Text, markDone) {
+		t.Errorf("a failed lookup must produce no markers:\n%s", msg.Text)
+	}
+	if n := len(keyboardOf(t, msg.ReplyMarkup).InlineKeyboard); n != 3 { // 3 results, no nav row
+		t.Errorf("keyboard has %d rows, want 3", n)
 	}
 }
 

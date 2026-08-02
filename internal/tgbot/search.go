@@ -11,6 +11,7 @@ import (
 
 	"github.com/freemanoid/tg-torrent-bot/internal/grab"
 	"github.com/freemanoid/tg-torrent-bot/internal/prowlarr"
+	"github.com/freemanoid/tg-torrent-bot/internal/store"
 	"github.com/freemanoid/tg-torrent-bot/internal/transmission"
 )
 
@@ -91,9 +92,68 @@ func (h *Handlers) HandleText(ctx context.Context, api telegramAPI, update *mode
 	}
 
 	id := h.cache.Put(cachedSearch{Query: query, Releases: releases})
+	marks := h.pageMarks(ctx, releases, 0)
 	h.answerSearch(ctx, api, ack,
-		resultsMessage(query, releases, 0),
-		resultsKeyboard(id, releases, 0))
+		resultsMessage(query, releases, 0, marks),
+		resultsKeyboard(id, releases, 0, marks))
+}
+
+// pageMarks reports which releases on the given page the bot already grabbed,
+// as a marker per release index.
+//
+// It is computed at render time rather than cached with the search: a page flip
+// re-renders the whole message, and a torrent that finishes while the message
+// is open should show its new state on the next tap. Only the page's releases
+// are looked up, so the query stays bounded however large the table grows.
+//
+// A store failure yields no marks, never an error: the markers are a
+// convenience, and losing them must not cost a search that took minutes to run.
+func (h *Handlers) pageMarks(ctx context.Context, releases []prowlarr.Release, page int) map[int]string {
+	start, end := pageBounds(len(releases), page)
+	if start >= end {
+		return nil
+	}
+
+	hashes := make([]string, 0, end-start)
+	titles := make([]string, 0, end-start)
+	for _, r := range releases[start:end] {
+		if r.InfoHash != "" {
+			hashes = append(hashes, r.InfoHash)
+		}
+		titles = append(titles, r.Title)
+	}
+
+	found, err := h.subs.FindDownloads(ctx, hashes, titles)
+	if err != nil {
+		h.log.Warn("look up download state", "error", err)
+		return nil
+	}
+
+	byHash := make(map[string]store.Download, len(found))
+	byTitle := make(map[string]store.Download, len(found))
+	for _, dl := range found {
+		byHash[strings.ToLower(dl.Hash)] = dl
+		byTitle[dl.Title] = dl
+	}
+
+	marks := make(map[int]string, end-start)
+	for i := start; i < end; i++ {
+		r := releases[i]
+		// The hash identifies the release even when an indexer words its title
+		// differently, so it wins; the title covers the releases that carry no
+		// hash at all.
+		dl, ok := byHash[strings.ToLower(r.InfoHash)]
+		if !ok || r.InfoHash == "" {
+			dl, ok = byTitle[r.Title]
+		}
+		if !ok {
+			continue
+		}
+		if m := statusMark(dl.Status); m != "" {
+			marks[i] = m
+		}
+	}
+	return marks
 }
 
 // ackSearching posts a placeholder before a Prowlarr search so the chat shows
@@ -176,8 +236,9 @@ func (h *Handlers) HandleCallback(ctx context.Context, api telegramAPI, update *
 // flipPage swaps the result message's keyboard (and header) to another page.
 func (h *Handlers) flipPage(ctx context.Context, api telegramAPI, cb *models.CallbackQuery, searchID string, entry cachedSearch, page int) {
 	page = clampPage(len(entry.Releases), page)
-	text := resultsMessage(entry.Query, entry.Releases, page)
-	kb := resultsKeyboard(searchID, entry.Releases, page)
+	marks := h.pageMarks(ctx, entry.Releases, page)
+	text := resultsMessage(entry.Query, entry.Releases, page, marks)
+	kb := resultsKeyboard(searchID, entry.Releases, page, marks)
 
 	if msg := cb.Message.Message; msg != nil {
 		_, err := api.EditMessageText(ctx, &bot.EditMessageTextParams{
@@ -256,15 +317,16 @@ func splitMessage(text string, limit int) []string {
 	return chunks
 }
 
-// resultsKeyboard builds one page of result buttons plus a pager row.
-func resultsKeyboard(searchID string, releases []prowlarr.Release, page int) *models.InlineKeyboardMarkup {
+// resultsKeyboard builds one page of result buttons plus a pager row. marks
+// carries the download-state marker per release index and may be nil.
+func resultsKeyboard(searchID string, releases []prowlarr.Release, page int, marks map[int]string) *models.InlineKeyboardMarkup {
 	page = clampPage(len(releases), page)
 	start, end := pageBounds(len(releases), page)
 
 	rows := make([][]models.InlineKeyboardButton, 0, end-start+1)
 	for i := start; i < end; i++ {
 		rows = append(rows, []models.InlineKeyboardButton{{
-			Text:         buttonLabel(i+1, releases[i]),
+			Text:         buttonLabel(i+1, releases[i], marks[i]),
 			CallbackData: encodeCallback(cbDownload, searchID, i),
 		}})
 	}

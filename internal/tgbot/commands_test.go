@@ -23,19 +23,24 @@ type pauseCall struct {
 }
 
 type fakeSubStore struct {
-	subs      map[int64]store.Subscription
-	created   []store.Subscription
-	deleted   []int64
-	pauses    []pauseCall
-	active    []store.Download
-	added     []recordedDownload
-	createErr error
-	getErr    error
-	listErr   error
-	deleteErr error
-	pauseErr  error
-	activeErr error
-	addDLErr  error
+	subs       map[int64]store.Subscription
+	created    []store.Subscription
+	deleted    []int64
+	pauses     []pauseCall
+	active     []store.Download
+	completed  []store.Download
+	recorded   []store.Download // what FindDownloads matches against
+	findTitles []string         // every title FindDownloads was asked about
+	added      []recordedDownload
+	createErr  error
+	getErr     error
+	listErr    error
+	deleteErr  error
+	pauseErr   error
+	activeErr  error
+	findErr    error
+	doneErr    error
+	addDLErr   error
 }
 
 func newFakeSubStore(subs ...store.Subscription) *fakeSubStore {
@@ -107,6 +112,30 @@ func (f *fakeSubStore) SetSubscriptionPaused(_ context.Context, id int64, paused
 
 func (f *fakeSubStore) ActiveDownloads(context.Context) ([]store.Download, error) {
 	return f.active, f.activeErr
+}
+
+// FindDownloads matches recorded downloads the way the store does: hash
+// case-insensitively, title exactly.
+func (f *fakeSubStore) FindDownloads(_ context.Context, hashes, titles []string) ([]store.Download, error) {
+	if f.findErr != nil {
+		return nil, f.findErr
+	}
+	f.findTitles = append(f.findTitles, titles...)
+	var found []store.Download
+	for _, dl := range f.recorded {
+		byHash := slices.ContainsFunc(hashes, func(h string) bool { return strings.EqualFold(h, dl.Hash) })
+		if byHash || slices.Contains(titles, dl.Title) {
+			found = append(found, dl)
+		}
+	}
+	return found, nil
+}
+
+func (f *fakeSubStore) RecentCompleted(_ context.Context, limit int) ([]store.Download, error) {
+	if f.doneErr != nil {
+		return nil, f.doneErr
+	}
+	return f.completed[:min(limit, len(f.completed))], nil
 }
 
 func (f *fakeSubStore) AddDownload(_ context.Context, hash, title, source string) error {
@@ -655,8 +684,86 @@ func TestStatusCommandEmpty(t *testing.T) {
 
 	command(t, h, tg, "/status")
 
-	if got := tg.lastSentText(t); !strings.Contains(got, "No active downloads") {
-		t.Errorf("reply %q should say there are no active downloads", got)
+	if got := tg.lastSentText(t); !strings.Contains(got, "No downloads yet") {
+		t.Errorf("reply %q should say there are no downloads at all", got)
+	}
+}
+
+func TestStatusCommandListsCompleted(t *testing.T) {
+	added := time.Date(2026, 7, 30, 9, 11, 0, 0, time.UTC)
+	subs := newFakeSubStore()
+	subs.active = []store.Download{{ID: 3, Hash: "aaa", Title: "Running", Status: store.StatusActive}}
+	subs.completed = []store.Download{
+		{ID: 2, Hash: "bbb", Title: "Finished Later", Status: store.StatusDone, AddedAt: added},
+		{ID: 1, Hash: "ccc", Title: "Finished Earlier", Status: store.StatusDone, AddedAt: added},
+	}
+	tr := &fakeTrans{statuses: []transmission.TorrentStatus{{Hash: "aaa", Percent: 0.5}}}
+	h := newCommandHandlers(&fakeSearcher{}, tr, subs)
+	tg := &fakeTG{}
+
+	command(t, h, tg, "/status")
+
+	got := tg.lastSentText(t)
+	for _, want := range []string{
+		"⬇️ Active downloads", "Running",
+		"✅ Recently completed", "Finished Later", "Finished Earlier",
+		// The store records when a download was added, not when it finished.
+		"added 2026-07-30 09:11",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("status reply %q missing %q", got, want)
+		}
+	}
+}
+
+func TestStatusCommandOmitsEmptySections(t *testing.T) {
+	subs := newFakeSubStore()
+	subs.completed = []store.Download{{ID: 1, Hash: "bbb", Title: "Only History", Status: store.StatusDone}}
+	h := newCommandHandlers(&fakeSearcher{}, &fakeTrans{}, subs)
+	tg := &fakeTG{}
+
+	command(t, h, tg, "/status")
+
+	got := tg.lastSentText(t)
+	if !strings.Contains(got, "Only History") {
+		t.Errorf("reply %q should list the completed download", got)
+	}
+	if strings.Contains(got, "Active downloads") {
+		t.Errorf("reply %q should omit the empty active section", got)
+	}
+}
+
+func TestStatusCommandCapsCompleted(t *testing.T) {
+	subs := newFakeSubStore()
+	for i := range maxCompletedLines + 5 {
+		subs.completed = append(subs.completed, store.Download{
+			ID:     int64(i),
+			Hash:   fmt.Sprintf("h%d", i),
+			Title:  fmt.Sprintf("Done %d", i),
+			Status: store.StatusDone,
+		})
+	}
+	h := newCommandHandlers(&fakeSearcher{}, &fakeTrans{}, subs)
+	tg := &fakeTG{}
+
+	command(t, h, tg, "/status")
+
+	if got := strings.Count(tg.lastSentText(t), "\n• "); got != maxCompletedLines {
+		t.Errorf("status listed %d completed downloads, want %d", got, maxCompletedLines)
+	}
+}
+
+func TestStatusCommandCompletedStoreError(t *testing.T) {
+	subs := newFakeSubStore()
+	subs.doneErr = errors.New("database locked")
+	h := newCommandHandlers(&fakeSearcher{}, &fakeTrans{}, subs)
+	tg := &fakeTG{}
+
+	command(t, h, tg, "/status")
+
+	got := tg.lastSentText(t)
+	if !strings.Contains(got, "Failed to list downloads") || !strings.Contains(got, "database locked") {
+		t.Errorf("reply %q should surface the store error", got)
 	}
 }
 
@@ -677,15 +784,24 @@ func TestStatusCommandStoreError(t *testing.T) {
 
 func TestStatusCommandTransmissionError(t *testing.T) {
 	subs := newFakeSubStore()
-	subs.active = []store.Download{{ID: 1, Hash: "aaa", Title: "T", Status: store.StatusActive}}
+	subs.active = []store.Download{{ID: 1, Hash: "aaa", Title: "Still Running", Status: store.StatusActive}}
+	subs.completed = []store.Download{{ID: 2, Hash: "bbb", Title: "From History", Status: store.StatusDone}}
 	tr := &fakeTrans{activeErr: errors.New("connection refused")}
 	h := newCommandHandlers(&fakeSearcher{}, tr, subs)
 	tg := &fakeTG{}
 
 	command(t, h, tg, "/status")
 
-	if got := tg.lastSentText(t); !strings.Contains(got, "connection refused") {
+	got := tg.lastSentText(t)
+	if !strings.Contains(got, "connection refused") {
 		t.Errorf("reply %q should surface the Transmission error", got)
+	}
+	// Only the live progress figures need Transmission. Both lists come from
+	// the store, so an outage must not hide them.
+	for _, want := range []string{"Still Running", "From History"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("reply %q lost %q to the Transmission outage", got, want)
+		}
 	}
 }
 

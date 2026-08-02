@@ -206,33 +206,28 @@ Transmission's RPC has no auth on this setup, so `TRANSMISSION_USER` /
 `TRANSMISSION_PASS` stay empty. Downloads land in `/home/umbrel/umbrel/home/Downloads`
 on the host (the external SSD).
 
-### Updating a deployed bot
+### Releasing
 
-From the Mac, re-sync and rebuild on the Pi:
-
-```sh
-rsync -av --exclude data/ --exclude .env \
-  /path/to/tg-torrent-bot/ umbrel@umbrel.local:~/tg-torrent-bot/
-ssh umbrel@umbrel.local
-cd ~/tg-torrent-bot
-docker build -t tg-torrent-bot:latest .
-docker compose up -d          # recreates the container on the new image
-```
-
-`data/` is excluded from the rsync and bind-mounted into the container, so the
-SQLite database (subscriptions + seen history) survives updates. With Portainer,
-build the image on the Pi first, then redeploy the stack from the UI.
-
-**Exclude `.env`.** It is gitignored, so the copy on the Pi is the only one with
-the working values; a plain `rsync` would overwrite it with the dev machine's
-copy and silently point the bot back at unreachable URLs. There is no Go
-toolchain on the Pi, so run tests there through the build image:
+Images are built by GitHub Actions on version tags and published to
+`ghcr.io/freemanoid/tg-torrent-bot` (multi-arch: amd64 + arm64):
 
 ```sh
-docker run --rm -v "$PWD":/src -w /src -v tgbot-gocache:/gocache \
-  -e GOCACHE=/gocache/build -e GOMODCACHE=/gocache/mod \
-  golang:1.26-alpine sh -c 'go vet ./... && go test ./...'
+git tag v1.2.3
+git push origin v1.2.3
 ```
+
+The workflow run's summary shows the pushed image digest. To roll it out:
+
+- **Umbrel (community app)**: bump `version` and the pinned image digest in the
+  [app store repo](https://github.com/freemanoid/umbrel-app-store); the app then
+  shows an update button in the Umbrel dashboard.
+- **Plain compose**: `docker compose pull && docker compose up -d`.
+
+State always survives updates: the SQLite database lives on a mounted volume
+(`app-data/.../data/` on Umbrel), and `.env` is external to the image.
+
+A `workflow_dispatch` run of the release workflow builds both platforms without
+pushing — a dry run for Dockerfile changes.
 
 Tip: tune your first real subscription with `/test <id>` against live results
 before trusting auto-grab.

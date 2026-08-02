@@ -224,7 +224,7 @@ func TestHandleTextAcksBeforeSearching(t *testing.T) {
 }
 
 func TestHandleTextBuildsKeyboard(t *testing.T) {
-	s := &fakeSearcher{releases: nReleases(25)}
+	s := &fakeSearcher{releases: nReleases(2*perPage + 5)}
 	h, _ := newTestHandlers(s, &fakeTrans{})
 	tg := &fakeTG{}
 
@@ -300,7 +300,7 @@ func TestHandleTextNoResults(t *testing.T) {
 
 func TestHandleTextAckSendFailureStillDelivers(t *testing.T) {
 	// The ack is a courtesy: losing it must not cost the user their results.
-	s := &fakeSearcher{releases: nReleases(25)}
+	s := &fakeSearcher{releases: nReleases(2*perPage + 5)}
 	h, _ := newTestHandlers(s, &fakeTrans{})
 	tg := &fakeTG{sendErrs: []error{errors.New("telegram hiccup")}}
 
@@ -325,7 +325,7 @@ func TestHandleTextAckSendFailureStillDelivers(t *testing.T) {
 }
 
 func TestHandleTextAckEditFailureFallsBackToFreshMessage(t *testing.T) {
-	s := &fakeSearcher{releases: nReleases(25)}
+	s := &fakeSearcher{releases: nReleases(2*perPage + 5)}
 	h, _ := newTestHandlers(s, &fakeTrans{})
 	tg := &fakeTG{editErr: errors.New("message to edit not found")}
 
@@ -549,7 +549,7 @@ func TestPageCallbackEditsKeyboard(t *testing.T) {
 	h, _ := newTestHandlers(&fakeSearcher{}, &fakeTrans{})
 	tg := &fakeTG{}
 
-	id := h.cache.Put(cachedSearch{Query: "q", Releases: nReleases(25)})
+	id := h.cache.Put(cachedSearch{Query: "q", Releases: nReleases(2*perPage + 5)})
 
 	h.HandleCallback(context.Background(), tg, callbackUpdate(encodeCallback(cbPage, id, 1)))
 
@@ -596,7 +596,7 @@ func TestPageCallbackEditFailureFallsBackToFreshMessage(t *testing.T) {
 	h, _ := newTestHandlers(&fakeSearcher{}, &fakeTrans{})
 	tg := &fakeTG{editErr: errors.New("message to edit not found")}
 
-	id := h.cache.Put(cachedSearch{Query: "q", Releases: nReleases(25)})
+	id := h.cache.Put(cachedSearch{Query: "q", Releases: nReleases(2*perPage + 5)})
 
 	h.HandleCallback(context.Background(), tg, callbackUpdate(encodeCallback(cbPage, id, 1)))
 
@@ -616,7 +616,7 @@ func TestPageCallbackInaccessibleMessageSendsFresh(t *testing.T) {
 	h, _ := newTestHandlers(&fakeSearcher{}, &fakeTrans{})
 	tg := &fakeTG{}
 
-	id := h.cache.Put(cachedSearch{Query: "q", Releases: nReleases(25)})
+	id := h.cache.Put(cachedSearch{Query: "q", Releases: nReleases(2*perPage + 5)})
 	update := &models.Update{CallbackQuery: &models.CallbackQuery{
 		ID:   "cb1",
 		Data: encodeCallback(cbPage, id, 2),

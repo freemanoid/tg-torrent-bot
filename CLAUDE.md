@@ -38,6 +38,9 @@ One process, four loops wired in `cmd/bot/main.go` with an errgroup:
 
 Supporting packages: `internal/config` (settings file + env fallback),
 `internal/store` (SQLite), `internal/filter` (release matching),
+`internal/mediainfo` (pure title parser: resolution, source, codecs, audio,
+translations, subs, container, bitrate — Prowlarr publishes none of this as
+structured data, so it is read out of the release title),
 `internal/prowlarr` + `internal/transmission` (HTTP clients), `internal/grab`
 (shared "prefer .torrent, fall back to magnet" add policy used by both the
 Telegram handler and the engine — change it in one place, not two).
@@ -201,8 +204,12 @@ plus `String` so the `Parse ⇄ String` round-trip test still holds. Filters are
 persisted as raw token strings, so old subscriptions must keep parsing.
 
 **Change search results / keyboards** — `internal/tgbot/search.go` (flow),
-`format.go` (labels, callback packing). Callback data is hard-capped at 64
-bytes by Telegram; the search cache maps a short ID to results with a 1 h TTL.
+`format.go` (`resultsMessage` → `releaseBlock` for the text, `buttonLabel` for
+the keyboard, callback packing). What a release *says about itself* is parsed
+in `internal/mediainfo`; add a new codec, language or translation token to its
+`phrases` table rather than to the formatter. Callback data is hard-capped at
+64 bytes by Telegram; the search cache maps a short ID to results with a 1 h
+TTL.
 
 ## Nuances that bite
 
@@ -219,6 +226,11 @@ bytes by Telegram; the search cache maps a short ID to results with a 1 h TTL.
   cross-host redirects; `downloadUrl` can point anywhere.
 - **Telegram messages are chunked at 4096 chars**; unbounded replies (`/subs`,
   `/status`) would otherwise silently fail to send.
+- **The search results message cannot be chunked** — the inline keyboard is
+  attached to one message, so it must fit in a single send or a search that
+  cost minutes is lost. `resultsMessage` gives the five blocks on a page a
+  shared rune budget instead of dropping any, so the numbering keeps matching
+  the buttons. Raise `perPage` and that budget shrinks accordingly.
 - **On Umbrel, reach services by container name** (`prowlarr_server_1:9696`,
   `transmission_server_1:9091`). `umbrel.local` is mDNS and does not resolve
   inside containers, and published ports sit behind an auth proxy that answers
@@ -254,6 +266,8 @@ may hold pre-sanitization history — never push it, and prefer explicit
   mode, so the settings page can't be used to fix it.
 - Per-indexer failures are invisible: Prowlarr returns HTTP 200 with partial
   results, and only whole-request failures surface an indexer name.
-- Message chunking counts runes while Telegram counts UTF-16 units, so a chunk
-  ending in astral characters could still be rejected.
+- Message chunking (`splitMessage`) counts runes while Telegram counts UTF-16
+  units, so a chunk ending in astral characters could still be rejected.
+  `resultsMessage` is the exception — it budgets in UTF-16 units, because that
+  message carries the keyboard and cannot be re-sent as two.
 - No hot reload: every settings change costs a restart.

@@ -39,6 +39,7 @@ type Release struct {
 	Title       string `json:"title"`
 	Size        int64  `json:"size"` // bytes
 	Seeders     int    `json:"seeders"`
+	Leechers    int    `json:"leechers"`
 	Indexer     string `json:"indexer"`     // e.g. "TrackerA", "TrackerB"
 	DownloadURL string `json:"downloadUrl"` // .torrent proxied through Prowlarr; may be empty
 	MagnetURL   string `json:"magnetUrl"`   // may be empty

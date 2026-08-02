@@ -59,6 +59,7 @@ const searchJSON = `[
     "title": "Space Show 2026 Episode 14 [1080p, HEVC]",
     "size": 2147483648,
     "seeders": 3500,
+    "leechers": 87,
     "indexer": "TrackerA",
     "downloadUrl": "http://prowlarr:9696/1/download?apikey=k&link=def",
     "magnetUrl": "magnet:?xt=urn:btih:bbbb2222",
@@ -120,6 +121,7 @@ func TestSearchSortsAndMapsReleases(t *testing.T) {
 		Title:       "Space Show 2026 Episode 14 [1080p, HEVC]",
 		Size:        2147483648,
 		Seeders:     3500,
+		Leechers:    87,
 		Indexer:     "TrackerA",
 		DownloadURL: "http://prowlarr:9696/1/download?apikey=k&link=def",
 		MagnetURL:   "magnet:?xt=urn:btih:bbbb2222",
@@ -139,6 +141,11 @@ func TestSearchSortsAndMapsReleases(t *testing.T) {
 	}
 	if last.Size != 0 {
 		t.Errorf("missing size = %d, want 0", last.Size)
+	}
+	// Indexers that report no leecher count decode as 0; the display treats
+	// that the same as "not reported" and simply says nothing.
+	if last.Leechers != 0 {
+		t.Errorf("missing leechers = %d, want 0", last.Leechers)
 	}
 }
 

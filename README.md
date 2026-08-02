@@ -8,8 +8,10 @@ custom piece; everything else is off-the-shelf.
 It does two things:
 
 1. **Interactive search** — any plain-text message is a search query. The bot
-   asks Prowlarr (TrackerA+TrackerB), shows results as an inline keyboard
-   sorted by seeders, and one tap sends the torrent to Transmission. When the
+   asks Prowlarr (TrackerA+TrackerB) and lists the results sorted by seeders,
+   each with its full title, swarm health, and whatever the release title says
+   about the media inside (resolution, source, codecs, audio tracks,
+   subtitles, container). One tap sends the torrent to Transmission. When the
    download finishes, the bot sends a one-time "✅ finished" notification.
 2. **Subscriptions** — `/sub <query> | <filters>` (e.g.
    `/sub space show 2026 | rus, 1080p, x265, -720p`). A ticker re-runs the
@@ -86,6 +88,7 @@ cmd/bot/                wiring, setup mode, self-check, graceful shutdown
 internal/config/        settings file + env-var loading, validation
 internal/store/         SQLite: subscriptions, seen, downloads
 internal/filter/        include/exclude/size matching
+internal/mediainfo/     release-title parsing: codecs, audio, subs, container
 internal/prowlarr/      Prowlarr /api/v1/search client
 internal/transmission/  thin wrapper over hekmon/transmissionrpc
 internal/subs/          subscription engine + completion watcher
@@ -164,9 +167,28 @@ setup mode and waits for the form.
 | `/help` | Usage summary |
 | `/start` | Same as `/help` |
 
-Searches return the top 50 releases (10 per keyboard page), sorted by
+Searches return the top 50 releases (5 per keyboard page), sorted by
 seeders. Subscriptions grab at most 10 new matches per tick; the rest are
 picked up on the following ticks.
+
+Each result is listed like this:
+
+```
+1. Космос / Space Show (2026) [BDRemux 1080p, AVC, HDR10] MKV [Dub, MVO, AVO,
+   Original Eng + Sub Rus, Eng] DTS-HD MA 5.1, ~24000 kbps
+   4.5GB · ↑146 ↓12 · TrackerA
+   1080p Remux · H.264 · HDR10 · MKV · ~24000 kbps
+   Audio: DTS-HD MA 5.1 · Dub, MVO, AVO, Original · Eng
+   Subs: Rus, Eng
+   Apple TV 4K: ✅ plays (Infuse/Plex)
+```
+
+Everything below the size line is read out of the release title itself —
+Prowlarr publishes no structured media metadata — so a line is shown only when
+the title actually stated it. A release that names no codec simply has no codec
+line. The Apple TV 4K verdict assumes a third-party player (Infuse, Plex, VLC);
+under that profile only AV1 and 3D are flagged, since the built-in tvOS player
+would reject nearly every tracker release for its container alone.
 
 ## Filter syntax (`/sub`, after the `|`)
 

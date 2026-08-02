@@ -92,7 +92,7 @@ func (h *Handlers) HandleText(ctx context.Context, api telegramAPI, update *mode
 
 	id := h.cache.Put(cachedSearch{Query: query, Releases: releases})
 	h.answerSearch(ctx, api, ack,
-		resultsHeader(query, len(releases), 0),
+		resultsMessage(query, releases, 0),
 		resultsKeyboard(id, releases, 0))
 }
 
@@ -114,9 +114,10 @@ func (h *Handlers) ackSearching(ctx context.Context, api telegramAPI, query stri
 }
 
 // answerSearch turns the ack message into the final answer, falling back to a
-// fresh message when there is no ack or the edit fails. Every answer it is
-// given is a single short message, so unlike h.reply it needs no chunking —
-// the nil-keyboard path still routes through h.reply for the odd long error.
+// fresh message when there is no ack or the edit fails. A results answer must
+// stay one message — the keyboard is attached to it — so it is never chunked;
+// resultsMessage is what keeps it inside Telegram's limit. The nil-keyboard
+// path still routes through h.reply for the odd long error.
 func (h *Handlers) answerSearch(ctx context.Context, api telegramAPI, ack int, text string, kb models.ReplyMarkup) {
 	if ack != 0 {
 		_, err := api.EditMessageText(ctx, &bot.EditMessageTextParams{
@@ -175,7 +176,7 @@ func (h *Handlers) HandleCallback(ctx context.Context, api telegramAPI, update *
 // flipPage swaps the result message's keyboard (and header) to another page.
 func (h *Handlers) flipPage(ctx context.Context, api telegramAPI, cb *models.CallbackQuery, searchID string, entry cachedSearch, page int) {
 	page = clampPage(len(entry.Releases), page)
-	text := resultsHeader(entry.Query, len(entry.Releases), page)
+	text := resultsMessage(entry.Query, entry.Releases, page)
 	kb := resultsKeyboard(searchID, entry.Releases, page)
 
 	if msg := cb.Message.Message; msg != nil {

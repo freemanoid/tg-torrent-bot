@@ -6,13 +6,18 @@ Ships as an Umbrel community app; runs anywhere Docker does. ~9.5k lines
 including tests. `README.md` is the user-facing doc; this file is everything an
 agent needs to change the code safely.
 
+**Target host: a Raspberry Pi 4B (ARM64, 4–8 GB RAM) running umbrelOS**, next to
+Prowlarr and Transmission from Umbrel's app store, on a home LAN behind NAT.
+That shapes most of the design decisions below — see
+[Target environment](#target-environment).
+
 ## Build, test, run
 
 ```sh
 go test ./...        # full suite; must pass before every commit
 go vet ./...
 go build ./cmd/bot
-GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build ./cmd/bot   # Pi target, static
+GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build ./cmd/bot   # Pi target (ARM64), static
 docker build -t tg-torrent-bot:latest .                    # multi-stage, ~20 MB
 ```
 
@@ -39,6 +44,33 @@ Telegram handler and the engine — change it in one place, not two).
 
 **Setup mode**: if no complete config exists, `main` starts *only* the settings
 server — no store, no clients, no loops. `newApp(nil, opts)` is that path.
+
+## Target environment
+
+A Pi 4B is slow, memory-tight, and writes to flash. Consequences to respect
+when changing anything:
+
+- **ARM64, cross-compiled.** Every dependency must build with `CGO_ENABLED=0`;
+  a cgo dependency would break the static ARM64 build and the tiny image.
+- **Builds don't happen on the Pi anymore.** A native Docker build there took
+  ~3.5 min, so CI builds multi-arch images instead. Assume no Go toolchain on
+  the host.
+- **Be frugal at runtime.** The image is ~20 MB and the process idles at a few
+  MB. The host shares its RAM and CPU with every other Umbrel app — a media
+  server, DNS filtering, home automation — so don't add heavyweight
+  dependencies, background caches, or anything that holds large result sets in
+  memory.
+- **Polling is deliberately lazy** (20 min subscriptions, 30 s watcher) — it
+  keeps CPU and flash writes low. Don't tighten intervals without a reason, and
+  don't add a busy loop.
+- **Flash-friendly storage.** SQLite lives on the app-data volume (SSD or SD
+  card) in WAL mode with a single connection. Avoid chatty write patterns.
+- **A single search can take minutes.** Indexers behind Cloudflare go through
+  FlareSolverr; a cold challenge measured ~193 s. Everything downstream must
+  tolerate slow calls (hence the 240 s Prowlarr timeout) rather than assume
+  fast LAN latency.
+- **Home network, no inbound ports.** Telegram is long-polled and nothing
+  listens publicly; the settings page is LAN/proxy-only. Keep it that way.
 
 ## Data model
 

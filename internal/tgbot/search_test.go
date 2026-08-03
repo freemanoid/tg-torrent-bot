@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
@@ -124,6 +125,8 @@ type fakeTrans struct {
 	magnets   []string
 	statuses  []transmission.TorrentStatus
 	activeErr error
+	removed   []string
+	removeErr error
 }
 
 func (f *fakeTrans) AddTorrent(_ context.Context, meta []byte) (string, error) {
@@ -138,6 +141,11 @@ func (f *fakeTrans) AddMagnet(_ context.Context, link string) (string, error) {
 
 func (f *fakeTrans) Active(context.Context) ([]transmission.TorrentStatus, error) {
 	return f.statuses, f.activeErr
+}
+
+func (f *fakeTrans) RemoveTorrent(_ context.Context, hash string) error {
+	f.removed = append(f.removed, hash)
+	return f.removeErr
 }
 
 type recordedDownload struct{ hash, title, source string }
@@ -306,10 +314,13 @@ func TestHandleTextBuildsKeyboard(t *testing.T) {
 	}
 
 	nav := kb.InlineKeyboard[perPage+1]
-	if len(nav) != 1 {
-		t.Fatalf("nav row has %d buttons, want 1 (next only on first page)", len(nav))
+	if len(nav) != 2 {
+		t.Fatalf("nav row has %d buttons, want 2 (subscribe + next on the first page)", len(nav))
 	}
-	kind, _, n, err = decodeCallback(nav[0].CallbackData)
+	if kind, _, _, err := decodeCallback(nav[0].CallbackData); err != nil || kind != cbSub {
+		t.Errorf("nav button 0 = (%q, %v), want the subscribe button", kind, err)
+	}
+	kind, _, n, err = decodeCallback(nav[1].CallbackData)
 	if err != nil || kind != cbPage || n != 1 {
 		t.Errorf("nav button = (%q, %d, %v), want pg -> page 1", kind, n, err)
 	}
@@ -352,7 +363,7 @@ func TestResultsKeyboardLinksToTrackerPages(t *testing.T) {
 
 	// The pager stays last, so the keyboard reads results → details → links → nav.
 	nav := kb.InlineKeyboard[len(kb.InlineKeyboard)-1]
-	if kind, _, _, err := decodeCallback(nav[0].CallbackData); err != nil || kind != cbPage {
+	if kind, _, _, err := decodeCallback(nav[len(nav)-1].CallbackData); err != nil || kind != cbPage {
 		t.Errorf("last row = (%q, %v), want the pager", kind, err)
 	}
 
@@ -371,8 +382,8 @@ func TestResultsKeyboardOmitsLinkRowWithoutTrackerPages(t *testing.T) {
 
 	kb := resultsKeyboard("a1b2c3d4", releases, 0, nil)
 
-	if len(kb.InlineKeyboard) != len(releases)+1 { // results + details row only
-		t.Fatalf("keyboard has %d rows, want %d", len(kb.InlineKeyboard), len(releases)+1)
+	if len(kb.InlineKeyboard) != len(releases)+2 { // results + details row + nav row
+		t.Fatalf("keyboard has %d rows, want %d", len(kb.InlineKeyboard), len(releases)+2)
 	}
 	for _, row := range kb.InlineKeyboard {
 		for _, btn := range row {
@@ -483,8 +494,8 @@ func TestSearchSurvivesMarkLookupFailure(t *testing.T) {
 	if strings.Contains(msg.Text, markActive) || strings.Contains(msg.Text, markDone) {
 		t.Errorf("a failed lookup must produce no markers:\n%s", msg.Text)
 	}
-	if n := len(keyboardOf(t, msg.ReplyMarkup).InlineKeyboard); n != 4 { // 3 results + details row, no nav row
-		t.Errorf("keyboard has %d rows, want 4", n)
+	if n := len(keyboardOf(t, msg.ReplyMarkup).InlineKeyboard); n != 5 { // 3 results + details + nav (subscribe)
+		t.Errorf("keyboard has %d rows, want 5", n)
 	}
 }
 
@@ -967,8 +978,8 @@ func TestPageCallbackEditsKeyboard(t *testing.T) {
 		t.Errorf("first button on page 2 has index %d (%v), want %d", n, err, perPage)
 	}
 	nav := kb.InlineKeyboard[len(kb.InlineKeyboard)-1]
-	if len(nav) != 2 {
-		t.Errorf("middle page nav row has %d buttons, want prev+next", len(nav))
+	if len(nav) != 3 {
+		t.Errorf("middle page nav row has %d buttons, want subscribe+prev+next", len(nav))
 	}
 }
 
@@ -1250,5 +1261,195 @@ func TestNewBotOffline(t *testing.T) {
 	}
 	if b == nil {
 		t.Fatal("New returned nil bot")
+	}
+}
+
+// --- subscribe button ---
+
+func TestSubscribeButtonUsesTheSearchQueryVerbatim(t *testing.T) {
+	const query = "формула 1 2026 2160p rus"
+	h, subs := newTestHandlers(&fakeSearcher{}, &fakeTrans{})
+	tg := &fakeTG{}
+	id := h.cache.Put(cachedSearch{Query: query, Releases: nReleases(3)})
+
+	before := time.Now().UTC()
+	h.HandleCallback(context.Background(), tg, callbackUpdateFrom(testChatID, encodeCallback(cbSub, id, 0)))
+
+	if len(subs.created) != 1 {
+		t.Fatalf("created %d subscriptions, want 1", len(subs.created))
+	}
+	got := subs.created[0]
+	if got.Query != query {
+		t.Errorf("subscription query = %q, want the search text unchanged (%q)", got.Query, query)
+	}
+	if len(got.Include) != 0 || len(got.Exclude) != 0 {
+		t.Errorf("subscription filters = %v/%v, want none", got.Include, got.Exclude)
+	}
+	if got.CutoffAt.Before(before) {
+		t.Errorf("cutoff = %v, want a cutoff of roughly now (%v)", got.CutoffAt, before)
+	}
+	text := tg.lastSentText(t)
+	if !strings.Contains(text, query) || !strings.Contains(text, "🔔") {
+		t.Errorf("confirmation %q must name the query and say it is a subscription", text)
+	}
+}
+
+func TestSubscribeButtonReportsStoreFailure(t *testing.T) {
+	h, subs := newTestHandlers(&fakeSearcher{}, &fakeTrans{})
+	subs.createErr = errors.New("disk full")
+	tg := &fakeTG{}
+	id := h.cache.Put(cachedSearch{Query: "space show", Releases: nReleases(1)})
+
+	h.HandleCallback(context.Background(), tg, callbackUpdateFrom(testChatID, encodeCallback(cbSub, id, 0)))
+
+	if text := tg.lastSentText(t); !strings.Contains(text, "disk full") {
+		t.Errorf("reply %q must surface the store failure", text)
+	}
+}
+
+func TestSubscribeButtonOnExpiredSearch(t *testing.T) {
+	h, subs := newTestHandlers(&fakeSearcher{}, &fakeTrans{})
+	tg := &fakeTG{}
+
+	h.HandleCallback(context.Background(), tg, callbackUpdateFrom(testChatID, encodeCallback(cbSub, "deadbeef", 0)))
+
+	if len(subs.created) != 0 {
+		t.Errorf("created %d subscriptions from an expired search, want 0", len(subs.created))
+	}
+	if text := tg.lastSentText(t); !strings.Contains(text, "expired") {
+		t.Errorf("reply %q must explain the search expired", text)
+	}
+}
+
+// --- rejecting a grab ---
+
+// The reject buttons sit on notifications that outlive any search, so they
+// must never be turned away by the search cache.
+func TestRejectButtonWorksWithoutACachedSearch(t *testing.T) {
+	h, _ := newTestHandlers(&fakeSearcher{}, &fakeTrans{})
+	tg := &fakeTG{}
+	cb := callbackUpdateFrom(testChatID, encodeCallback(cbReject, "abc123", 0))
+	cb.CallbackQuery.Message.Message.Text = "📥 Sub #1 «space show» grabbed:\nSpace Show S01E11"
+
+	h.HandleCallback(context.Background(), tg, cb)
+
+	if len(tg.sent) != 0 {
+		t.Fatalf("sent %v, want none — the confirmation replaces the keyboard in place", tg.sent)
+	}
+	if len(tg.edited) != 1 {
+		t.Fatalf("edited %d messages, want 1", len(tg.edited))
+	}
+	edit := tg.edited[0]
+	if !strings.Contains(edit.Text, "Space Show S01E11") {
+		t.Errorf("edited text = %q, want the original message text kept", edit.Text)
+	}
+	kb := keyboardOf(t, edit.ReplyMarkup)
+	if len(kb.InlineKeyboard) != 1 || len(kb.InlineKeyboard[0]) != 2 {
+		t.Fatalf("confirm keyboard = %v, want one row of two buttons", kb.InlineKeyboard)
+	}
+	kind, hash, _, err := decodeCallback(kb.InlineKeyboard[0][0].CallbackData)
+	if err != nil || kind != cbRejectOK || hash != "abc123" {
+		t.Errorf("confirm button = (%q, %q, %v), want the delete confirmation for abc123", kind, hash, err)
+	}
+	kind, _, _, err = decodeCallback(kb.InlineKeyboard[0][1].CallbackData)
+	if err != nil || kind != cbRejectNo {
+		t.Errorf("second button = (%q, %v), want the keep button", kind, err)
+	}
+}
+
+func TestRejectConfirmedRemovesTorrentAndData(t *testing.T) {
+	tr := &fakeTrans{}
+	h, subs := newTestHandlers(&fakeSearcher{}, tr)
+	tg := &fakeTG{}
+	cb := callbackUpdateFrom(testChatID, encodeCallback(cbRejectOK, "abc123", 0))
+	cb.CallbackQuery.Message.Message.Text = "📥 grabbed:\nSpace Show S01E11"
+
+	h.HandleCallback(context.Background(), tg, cb)
+
+	if len(tr.removed) != 1 || tr.removed[0] != "abc123" {
+		t.Errorf("removed from Transmission = %v, want [abc123]", tr.removed)
+	}
+	if len(subs.cancelled) != 1 || subs.cancelled[0] != "abc123" {
+		t.Errorf("cancelled downloads = %v, want [abc123]", subs.cancelled)
+	}
+	if text := tg.lastSentText(t); !strings.Contains(text, "🗑") {
+		t.Errorf("reply %q must confirm the removal", text)
+	}
+	// The keyboard is cleared so the message cannot be acted on twice.
+	if len(tg.edited) != 1 {
+		t.Fatalf("edited %d messages, want 1", len(tg.edited))
+	}
+	if rows := keyboardOf(t, tg.edited[0].ReplyMarkup).InlineKeyboard; len(rows) != 0 {
+		t.Errorf("keyboard after removal = %v, want no buttons left", rows)
+	}
+}
+
+// Every allowed chat holds its own copy of the button; the second tap must
+// read as "already done", not as a failure.
+func TestRejectAlreadyRemovedIsNotAnError(t *testing.T) {
+	tr := &fakeTrans{removeErr: fmt.Errorf("gone: %w", transmission.ErrNotFound)}
+	h, subs := newTestHandlers(&fakeSearcher{}, tr)
+	tg := &fakeTG{}
+	cb := callbackUpdateFrom(testChatID, encodeCallback(cbRejectOK, "abc123", 0))
+	cb.CallbackQuery.Message.Message.Text = "📥 grabbed:\nSpace Show S01E11"
+
+	h.HandleCallback(context.Background(), tg, cb)
+
+	text := tg.lastSentText(t)
+	if !strings.Contains(text, "Already removed") {
+		t.Errorf("reply %q, want it to say the torrent was already removed", text)
+	}
+	if len(subs.cancelled) != 0 {
+		t.Errorf("cancelled = %v, want none — the first tap already closed the row", subs.cancelled)
+	}
+}
+
+func TestRejectSurfacesTransmissionFailure(t *testing.T) {
+	tr := &fakeTrans{removeErr: errors.New("connection refused")}
+	h, subs := newTestHandlers(&fakeSearcher{}, tr)
+	tg := &fakeTG{}
+	cb := callbackUpdateFrom(testChatID, encodeCallback(cbRejectOK, "abc123", 0))
+	cb.CallbackQuery.Message.Message.Text = "📥 grabbed:\nSpace Show S01E11"
+
+	h.HandleCallback(context.Background(), tg, cb)
+
+	if text := tg.lastSentText(t); !strings.Contains(text, "connection refused") {
+		t.Errorf("reply %q must surface the Transmission failure", text)
+	}
+	// Nothing was removed, so the row must stay as it is for a retry.
+	if len(subs.cancelled) != 0 {
+		t.Errorf("cancelled = %v, want none when the removal failed", subs.cancelled)
+	}
+}
+
+func TestRejectKeepRestoresTheUndoButton(t *testing.T) {
+	tr := &fakeTrans{}
+	h, subs := newTestHandlers(&fakeSearcher{}, tr)
+	tg := &fakeTG{}
+	cb := callbackUpdateFrom(testChatID, encodeCallback(cbRejectNo, "abc123", 0))
+	cb.CallbackQuery.Message.Message.Text = "📥 grabbed:\nSpace Show S01E11"
+
+	h.HandleCallback(context.Background(), tg, cb)
+
+	if len(tr.removed) != 0 || len(subs.cancelled) != 0 {
+		t.Fatalf("keeping a download must remove nothing (removed=%v cancelled=%v)", tr.removed, subs.cancelled)
+	}
+	if len(tg.edited) != 1 {
+		t.Fatalf("edited %d messages, want 1", len(tg.edited))
+	}
+	kb := keyboardOf(t, tg.edited[0].ReplyMarkup)
+	if len(kb.InlineKeyboard) != 1 || len(kb.InlineKeyboard[0]) != 1 {
+		t.Fatalf("restored keyboard = %v, want the single undo button back", kb.InlineKeyboard)
+	}
+	if kind, hash, _, err := decodeCallback(kb.InlineKeyboard[0][0].CallbackData); err != nil || kind != cbReject || hash != "abc123" {
+		t.Errorf("restored button = (%q, %q, %v), want the reject button for abc123", kind, hash, err)
+	}
+}
+
+// A cancelled download is gone from disk, so a later search must not claim the
+// bot still has it.
+func TestCancelledDownloadsAreUnmarkedInResults(t *testing.T) {
+	if got := statusMark(store.StatusCancelled); got != "" {
+		t.Errorf("statusMark(cancelled) = %q, want no marker", got)
 	}
 }

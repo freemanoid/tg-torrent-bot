@@ -422,3 +422,38 @@ func TestWatcherRunChecksPeriodically(t *testing.T) {
 		t.Fatal("Run did not exit on context cancel")
 	}
 }
+
+// A finished subscription grab still gets an undo: the user never chose it,
+// and by the time it lands they may well not want it.
+func TestFinishedSubscriptionGrabOffersUndo(t *testing.T) {
+	env := newWatchEnv(t,
+		store.Download{Hash: "aaa", Title: "Космос 2026 Серия 5 [1080p, Rus]", Source: "sub:3"},
+	)
+	env.trans.statuses = []transmission.TorrentStatus{doneStatus("aaa", "kosmos")}
+
+	env.watcher.Check(context.Background())
+
+	hashes := env.notify.grabHashes()
+	if len(hashes) != 1 || hashes[0] != "aaa" {
+		t.Errorf("completion notification hashes = %v, want [aaa]", hashes)
+	}
+}
+
+// A download the user picked out of search results is one they already decided
+// they wanted, so its completion carries no undo.
+func TestFinishedManualDownloadOffersNoUndo(t *testing.T) {
+	env := newWatchEnv(t,
+		store.Download{Hash: "aaa", Title: "Ubuntu 26.04 LTS", Source: "search"},
+	)
+	env.trans.statuses = []transmission.TorrentStatus{doneStatus("aaa", "ubuntu")}
+
+	env.watcher.Check(context.Background())
+
+	hashes := env.notify.grabHashes()
+	if len(hashes) != 1 || hashes[0] != "" {
+		t.Errorf("completion notification hashes = %v, want [\"\"] (a plain notification)", hashes)
+	}
+	if len(env.notify.messages()) != 1 {
+		t.Errorf("notifications = %q, want exactly 1", env.notify.messages())
+	}
+}

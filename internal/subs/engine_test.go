@@ -112,6 +112,12 @@ func (f *fakeStore) AddDownload(_ context.Context, hash, title, source string) e
 	return nil
 }
 
+func (f *fakeStore) isSeen(subID int64, guid string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.seen[seenKey(subID, guid)]
+}
+
 func (f *fakeStore) seenCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -188,6 +194,8 @@ type fakeTrans struct {
 	statuses    []transmission.TorrentStatus
 	activeErr   error
 	activeCalls int
+	removed     []string
+	removeErr   error
 }
 
 func (f *fakeTrans) AddTorrent(_ context.Context, meta []byte) (string, error) {
@@ -208,6 +216,22 @@ func (f *fakeTrans) AddMagnet(_ context.Context, link string) (string, error) {
 	}
 	f.magnets = append(f.magnets, link)
 	return f.hash, nil
+}
+
+func (f *fakeTrans) RemoveTorrent(_ context.Context, hash string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.removeErr != nil {
+		return f.removeErr
+	}
+	f.removed = append(f.removed, hash)
+	return nil
+}
+
+func (f *fakeTrans) removedHashes() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.removed...)
 }
 
 func (f *fakeTrans) Active(context.Context) ([]transmission.TorrentStatus, error) {
@@ -233,19 +257,35 @@ func (f *fakeTrans) addCount() int {
 }
 
 type fakeNotifier struct {
-	mu   sync.Mutex
-	err  error
-	msgs []string
+	mu     sync.Mutex
+	err    error
+	msgs   []string
+	hashes []string // info hash passed to NotifyGrab, "" for a plain Notify
 }
 
 func (f *fakeNotifier) Notify(_ context.Context, text string) error {
+	return f.record(text, "")
+}
+
+func (f *fakeNotifier) NotifyGrab(_ context.Context, text, hash string) error {
+	return f.record(text, hash)
+}
+
+func (f *fakeNotifier) record(text, hash string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.err != nil {
 		return f.err
 	}
 	f.msgs = append(f.msgs, text)
+	f.hashes = append(f.hashes, hash)
 	return nil
+}
+
+func (f *fakeNotifier) grabHashes() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.hashes...)
 }
 
 func (f *fakeNotifier) setErr(err error) {
@@ -835,5 +875,169 @@ func TestRunTicksPeriodically(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("Run did not exit on context cancel")
+	}
+}
+
+// --- publish-date cutoff ---
+
+// A subscription's cutoff is what makes "only what shows up from now on" work:
+// releases already on the tracker when it was created stay untouched.
+func TestTickSkipsReleasesPublishedBeforeCutoff(t *testing.T) {
+	cutoff := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	sub := f1Sub()
+	sub.CutoffAt = cutoff
+
+	env := newTestEnv(t, sub)
+	env.search.results["space show 2026"] = []prowlarr.Release{
+		{GUID: "g-old", Title: "Космос 2026 Серия 10 [1080p, Rus]", Size: 20 * gb,
+			DownloadURL: "http://prowlarr/dl/old", InfoHash: "ih-old",
+			PublishDate: cutoff.Add(-24 * time.Hour)},
+		{GUID: "g-new", Title: "Космос 2026 Серия 11 [1080p, Rus]", Size: 20 * gb,
+			DownloadURL: "http://prowlarr/dl/new", InfoHash: "ih-new",
+			PublishDate: cutoff.Add(time.Hour)},
+	}
+	env.search.torrents["http://prowlarr/dl/new"] = []byte("d4:infoe")
+
+	env.engine.Tick(context.Background())
+
+	if got := env.trans.addCount(); got != 1 {
+		t.Fatalf("added %d torrents, want only the one published after the cutoff", got)
+	}
+	// The backlog release must stay unseen: it was never handled, and a later
+	// widening of the cutoff should still be able to pick it up.
+	if env.store.isSeen(1, "g-old") {
+		t.Error("release older than the cutoff was marked seen")
+	}
+	if !env.store.isSeen(1, "g-new") {
+		t.Error("release newer than the cutoff was not marked seen")
+	}
+}
+
+// Without a cutoff — every subscription that predates the column, plus any
+// created with the backlog token — nothing changes.
+func TestTickWithoutCutoffGrabsOlderReleases(t *testing.T) {
+	env := newTestEnv(t, f1Sub())
+	env.search.results["space show 2026"] = []prowlarr.Release{
+		{GUID: "g-old", Title: "Космос 2026 Серия 10 [1080p, Rus]", Size: 20 * gb,
+			DownloadURL: "http://prowlarr/dl/old", InfoHash: "ih-old",
+			PublishDate: time.Now().UTC().Add(-365 * 24 * time.Hour)},
+	}
+	env.search.torrents["http://prowlarr/dl/old"] = []byte("d4:infoe")
+
+	env.engine.Tick(context.Background())
+
+	if got := env.trans.addCount(); got != 1 {
+		t.Errorf("added %d torrents, want 1 — a subscription with no cutoff takes the backlog", got)
+	}
+}
+
+// An indexer that publishes no date would otherwise force a choice between a
+// subscription that never grabs anything and one that dumps the whole backlog.
+// The first tick holds those releases back; later ticks take them.
+func TestTickHoldsUndatedReleasesOnFirstTickOnly(t *testing.T) {
+	cutoff := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	sub := f1Sub()
+	sub.CutoffAt = cutoff
+
+	env := newTestEnv(t, sub)
+	env.search.results["space show 2026"] = []prowlarr.Release{
+		{GUID: "g-undated", Title: "Космос 2026 Серия 10 [1080p, Rus]", Size: 20 * gb,
+			DownloadURL: "http://prowlarr/dl/u", InfoHash: "ih-u"},
+	}
+	env.search.torrents["http://prowlarr/dl/u"] = []byte("d4:infoe")
+
+	env.engine.Tick(context.Background())
+
+	if got := env.trans.addCount(); got != 0 {
+		t.Errorf("added %d torrents on the first tick, want 0 for an undated release", got)
+	}
+	if !env.store.isSeen(1, "g-undated") {
+		t.Error("undated release was not marked seen on the first tick, so it will be grabbed later")
+	}
+}
+
+func TestTickGrabsUndatedReleasesAfterFirstTick(t *testing.T) {
+	cutoff := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	sub := f1Sub()
+	sub.CutoffAt = cutoff
+	sub.LastCheckedAt = cutoff.Add(time.Hour) // already checked once
+
+	env := newTestEnv(t, sub)
+	env.search.results["space show 2026"] = []prowlarr.Release{
+		{GUID: "g-undated", Title: "Космос 2026 Серия 11 [1080p, Rus]", Size: 20 * gb,
+			DownloadURL: "http://prowlarr/dl/u", InfoHash: "ih-u"},
+	}
+	env.search.torrents["http://prowlarr/dl/u"] = []byte("d4:infoe")
+
+	env.engine.Tick(context.Background())
+
+	if got := env.trans.addCount(); got != 1 {
+		t.Errorf("added %d torrents, want 1 — an undated release is fair game after the first tick", got)
+	}
+}
+
+// A subscription with no cutoff has no reason to hold undated releases back,
+// even on its very first tick.
+func TestTickGrabsUndatedReleasesOnFirstTickWithoutCutoff(t *testing.T) {
+	env := newTestEnv(t, f1Sub())
+	env.search.results["space show 2026"] = []prowlarr.Release{
+		{GUID: "g-undated", Title: "Космос 2026 Серия 11 [1080p, Rus]", Size: 20 * gb,
+			DownloadURL: "http://prowlarr/dl/u", InfoHash: "ih-u"},
+	}
+	env.search.torrents["http://prowlarr/dl/u"] = []byte("d4:infoe")
+
+	env.engine.Tick(context.Background())
+
+	if got := env.trans.addCount(); got != 1 {
+		t.Errorf("added %d torrents, want 1", got)
+	}
+}
+
+// Holding undated releases back must not eat into the per-tick grab budget:
+// they cost no Transmission add.
+func TestUndatedReleasesDoNotConsumeGrabBudget(t *testing.T) {
+	cutoff := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	sub := f1Sub()
+	sub.CutoffAt = cutoff
+
+	env := newTestEnv(t, sub)
+	var releases []prowlarr.Release
+	for i := 0; i < maxGrabsPerTick; i++ {
+		releases = append(releases, prowlarr.Release{
+			GUID: fmt.Sprintf("g-undated-%d", i), Title: "Космос 2026 [1080p, Rus]", Size: 20 * gb,
+			MagnetURL: "magnet:?xt=u", InfoHash: fmt.Sprintf("ih-u%d", i),
+		})
+	}
+	releases = append(releases, prowlarr.Release{
+		GUID: "g-new", Title: "Космос 2026 Серия 11 [1080p, Rus]", Size: 20 * gb,
+		MagnetURL: "magnet:?xt=new", InfoHash: "ih-new", PublishDate: cutoff.Add(time.Hour),
+	})
+	env.search.results["space show 2026"] = releases
+
+	env.engine.Tick(context.Background())
+
+	if got := env.trans.addCount(); got != 1 {
+		t.Errorf("added %d torrents, want 1 — undated skips must not use up the grab cap", got)
+	}
+	if !env.store.isSeen(1, "g-new") {
+		t.Error("the dated release was not grabbed")
+	}
+}
+
+// The grab announcement must carry the info hash so the chat can offer to undo
+// it; a message alone would leave the button with nothing to remove.
+func TestGrabNotificationCarriesInfoHash(t *testing.T) {
+	env := newTestEnv(t, f1Sub())
+	env.trans.hash = "confirmed-hash"
+	env.search.results["space show 2026"] = []prowlarr.Release{
+		{GUID: "g1", Title: "Космос 2026 Серия 5 [1080p, Rus]", Size: 20 * gb,
+			MagnetURL: "magnet:?xt=1", InfoHash: "ih1"},
+	}
+
+	env.engine.Tick(context.Background())
+
+	hashes := env.notify.grabHashes()
+	if len(hashes) != 1 || hashes[0] != "confirmed-hash" {
+		t.Errorf("grab notification hashes = %v, want [confirmed-hash] (the hash Transmission confirmed)", hashes)
 	}
 }

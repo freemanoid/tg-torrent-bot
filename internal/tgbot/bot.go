@@ -52,9 +52,24 @@ func New(token string, allowedChatIDs []int64, h *Handlers, extra ...bot.Option)
 // own message: the others are still sent, and an error comes back only when
 // none got through, so one broken chat cannot silence the rest.
 func (b *Bot) Notify(ctx context.Context, text string) error {
+	return b.notify(ctx, text, nil)
+}
+
+// NotifyGrab is Notify for a torrent the bot decided to download on its own:
+// the same message, plus a button that rejects it.
+//
+// Every allowed chat gets its own copy of that button, all pointing at the one
+// torrent. Whoever taps first does the removal and the rest go stale, which is
+// exactly why the removal treats an already-gone torrent as success.
+func (b *Bot) NotifyGrab(ctx context.Context, text, hash string) error {
+	return b.notify(ctx, text, rejectKeyboard(hash))
+}
+
+func (b *Bot) notify(ctx context.Context, text string, kb models.ReplyMarkup) error {
 	var errs []error
 	for _, id := range b.chatIDs {
-		if _, err := b.api.SendMessage(ctx, &bot.SendMessageParams{ChatID: id, Text: text}); err != nil {
+		_, err := b.api.SendMessage(ctx, &bot.SendMessageParams{ChatID: id, Text: text, ReplyMarkup: kb})
+		if err != nil {
 			b.log.Warn("telegram notify", "chat_id", id, "error", err)
 			errs = append(errs, err)
 		}

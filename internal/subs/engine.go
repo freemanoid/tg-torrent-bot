@@ -28,6 +28,11 @@ const DefaultTickInterval = 20 * time.Minute
 // the following ticks.
 const maxGrabsPerTick = 10
 
+// subSourcePrefix marks a store.Download the subscription engine added, as
+// opposed to one the user picked out of search results. The watcher reads it
+// to decide whether a finished download is worth offering to undo.
+const subSourcePrefix = "sub:"
+
 // Store is the persistence surface the engine uses; *store.Store implements
 // it, tests fake it.
 type Store interface {
@@ -51,9 +56,14 @@ type Searcher interface {
 var _ Searcher = (*prowlarr.Client)(nil)
 
 // Notifier delivers a message to the user (in production: a Telegram message
-// to the allowed chat).
+// to every allowed chat).
 type Notifier interface {
 	Notify(ctx context.Context, text string) error
+	// NotifyGrab delivers a message about a torrent the bot added on its own,
+	// alongside a way to reject it. hash is the info hash Transmission
+	// confirmed, which is all the rejection needs to act on — how that choice
+	// is offered is the notifier's business, not the engine's.
+	NotifyGrab(ctx context.Context, text, hash string) error
 }
 
 // Engine periodically checks all active subscriptions and grabs new matches.
@@ -145,10 +155,16 @@ func (e *Engine) checkSub(ctx context.Context, sub store.Subscription) error {
 		Exclude:   sub.Exclude,
 		MinSizeMB: sub.MinSizeMB,
 		MaxSizeMB: sub.MaxSizeMB,
+		Since:     sub.CutoffAt,
 	}
+	// A subscription that has never been checked is seeing the tracker's whole
+	// back catalogue at once; from the second tick on, everything it finds is
+	// genuinely new to it. That distinction is what makes undated releases
+	// safe to take later — see holdUndated.
+	firstTick := sub.LastCheckedAt.IsZero()
 	grabbed := 0
 	for _, r := range releases {
-		if !f.Match(r.Title, r.Size) {
+		if !f.Match(r.Title, r.Size, r.PublishDate) {
 			continue
 		}
 		if grabbed >= maxGrabsPerTick {
@@ -166,6 +182,14 @@ func (e *Engine) checkSub(ctx context.Context, sub store.Subscription) error {
 		if seen {
 			continue
 		}
+		if holdUndated(sub, r, firstTick) {
+			// Nothing was downloaded, so this must not count against the grab
+			// cap; marking it seen is what keeps it out of the next tick.
+			if err := e.store.MarkSeen(ctx, sub.ID, r.GUID, r.InfoHash, r.Title); err != nil {
+				e.log.Error("mark undated release seen", "sub", sub.ID, "guid", r.GUID, "error", err)
+			}
+			continue
+		}
 		if e.grabRelease(ctx, sub, r) {
 			grabbed++
 		}
@@ -175,6 +199,17 @@ func (e *Engine) checkSub(ctx context.Context, sub store.Subscription) error {
 		e.log.Warn("record last check", "sub", sub.ID, "error", err)
 	}
 	return nil
+}
+
+// holdUndated reports whether a release should be recorded as handled without
+// being downloaded. It covers the one case the publish-date cutoff cannot
+// judge: an indexer that reports no date at all. Failing those closed forever
+// would leave a subscription silently grabbing nothing; taking them would hand
+// over the whole backlog the cutoff exists to avoid. Holding them back on the
+// first tick only splits the difference — the backlog is skipped once, and
+// everything the subscription meets afterwards is new to it by construction.
+func holdUndated(sub store.Subscription, r prowlarr.Release, firstTick bool) bool {
+	return firstTick && !sub.CutoffAt.IsZero() && r.PublishDate.IsZero()
 }
 
 // grabRelease hands one release to Transmission and records it, reporting
@@ -187,7 +222,7 @@ func (e *Engine) grabRelease(ctx context.Context, sub store.Subscription, r prow
 		e.log.Error("add release", "sub", sub.ID, "title", r.Title, "error", err)
 		return false
 	}
-	if err := e.store.AddDownload(ctx, hash, r.Title, fmt.Sprintf("sub:%d", sub.ID)); err != nil {
+	if err := e.store.AddDownload(ctx, hash, r.Title, fmt.Sprintf("%s%d", subSourcePrefix, sub.ID)); err != nil {
 		// The torrent is already downloading; only the completion
 		// notification is lost.
 		e.log.Error("record download", "hash", hash, "error", err)
@@ -201,7 +236,10 @@ func (e *Engine) grabRelease(ctx context.Context, sub store.Subscription, r prow
 		e.log.Warn("increment grabs", "sub", sub.ID, "error", err)
 	}
 	msg := fmt.Sprintf("📥 Sub #%d «%s» grabbed:\n%s", sub.ID, sub.Query, r.Title)
-	if err := e.notifier.Notify(ctx, msg); err != nil {
+	// The hash Transmission confirmed, not the one the indexer advertised:
+	// rejecting this download has to name the torrent Transmission actually
+	// holds, and a magnet-only release may have advertised none at all.
+	if err := e.notifier.NotifyGrab(ctx, msg, hash); err != nil {
 		e.log.Error("notify grab", "sub", sub.ID, "error", err)
 	}
 	return true

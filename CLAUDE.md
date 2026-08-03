@@ -84,16 +84,63 @@ when changing anything:
 ## Data model
 
 `store.Subscription{ID, Query, Include, Exclude, MinSizeMB, MaxSizeMB, Paused,
-Grabs, CreatedAt, LastCheckedAt}` — `Include`/`Exclude` are raw filter tokens,
-rebuilt into a `filter.Filter` by `subFilter()`.
+Grabs, CreatedAt, LastCheckedAt, CutoffAt}` — `Include`/`Exclude` are raw filter
+tokens, rebuilt into a `filter.Filter` by `subFilter()`. `CutoffAt` is the
+publish-date floor; zero means no floor — see [Subscription
+cutoff](#subscription-cutoff).
 
 `store.Download{Hash, Title, Source, Status, AddedAt}` — `Source` is `"search"`
-or `"sub:<id>"`; `Status` is active/done. The `seen` table (`subID`+`guid`) is
-what prevents re-grabbing; it cascades on subscription delete.
+or `"sub:<id>"`; `Status` is active/done/cancelled. The `seen` table
+(`subID`+`guid`) is what prevents re-grabbing; it cascades on subscription
+delete.
 
-`prowlarr.Release{GUID, Title, Size, Seeders, Indexer, DownloadURL, MagnetURL,
-InfoHash}` — `DownloadURL`/`MagnetURL` may each be empty; `grab.AddRelease`
-handles all four combinations.
+`prowlarr.Release{GUID, Title, Size, Seeders, Leechers, Indexer, DownloadURL,
+MagnetURL, InfoHash, Description, InfoURL, PublishDate, Grabs, FileCount}` —
+`DownloadURL`/`MagnetURL` may each be empty; `grab.AddRelease` handles all four
+combinations. `PublishDate` is zero whenever the indexer reported none, which
+is what the cutoff has to work around.
+
+## Subscription cutoff
+
+A subscription grabs only what was published after it was created. Four
+decisions carry it:
+
+- **The cutoff lives on the subscription, not in the filter syntax.**
+  `subscriptions.cutoff_at` is NULL for "no cutoff". `filter.Filter.Since`
+  carries it into `Match` so the engine and the `/test` dry run share one
+  predicate — but `Parse` never sets it and `String` never renders it, or the
+  `Parse ⇄ String` round-trip would grow a token that cannot be read back.
+- **`backlog` is stripped before `filter.Parse`.** It is a subscription
+  setting; left in the token list it would become a required substring and the
+  subscription would match nothing at all. `cutBacklogToken` does this in
+  `cmdSub`.
+- **Undated releases are held back on the first tick only** (`holdUndated`).
+  Failing them closed forever would leave a subscription silently grabbing
+  nothing; taking them would hand over the backlog the cutoff exists to avoid.
+  `LastCheckedAt.IsZero()` is the first-tick signal — no new column.
+- **Subscriptions that predate the column keep `cutoff_at` NULL.** They have
+  already grabbed part of their backlog, and `maxGrabsPerTick` may have
+  deferred the rest; a retroactive cutoff would strand it permanently.
+
+## Rejecting a grab
+
+Every subscription grab and every subscription completion carries a 🗑 button
+(`cbReject` → `cbRejectOK`/`cbRejectNo`). Confirming removes the torrent from
+Transmission **with its data** and marks the row `cancelled`.
+
+- **The reject callbacks carry an info hash, not a search id**, so
+  `HandleCallback` routes them *before* the search-cache lookup — the
+  notification they sit on long outlives any cached search.
+- **The seen row stays.** The user said no; re-grabbing it next tick would be
+  the opposite of what they asked for.
+- **`CompleteDownload` refuses a cancelled row.** The watcher can be mid-cycle
+  when the rejection lands, and finishing it afterwards would resurrect it into
+  `/status` history.
+- **The button exists in every allowed chat**, so a torrent that is already
+  gone is the expected second tap: `transmission.ErrNotFound` reads as "already
+  removed", never as a failure.
+- **A cancelled download is unmarked in search results** — its data is gone, so
+  showing ⬇️ or ✅ for it would be a lie.
 
 The `meta` table is a plain key/value store for bookkeeping that belongs to the
 install rather than to a subscription; today it holds `announced_version`.

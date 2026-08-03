@@ -13,11 +13,18 @@ It does two things:
    about the media inside (resolution, source, codecs, audio tracks,
    subtitles, container). One tap sends the torrent to Transmission. When the
    download finishes, the bot sends a one-time "✅ finished" notification.
-2. **Subscriptions** — `/sub <query> | <filters>` (e.g.
+2. **Subscriptions** — tap 🔔 under any search results to watch that exact
+   query, or write one out with `/sub <query> | <filters>` (e.g.
    `/sub space show 2026 | rus, 1080p, x265, -720p`). A ticker re-runs the
    search every ~20 minutes, applies include/exclude/size filters, dedupes
    against a seen-table, auto-adds new matches to Transmission, and notifies
    via Telegram. Hands-off auto-downloading of recurring content.
+
+   A subscription only grabs releases **published after it was created**, so
+   subscribing to a series mid-run does not pull in every earlier episode; add
+   the `backlog` filter when you do want what is already on the tracker. Each
+   grab is announced with a 🗑 button that removes the torrent and deletes its
+   files, for the times the bot guessed wrong.
 
 After an app update the bot posts what it is now running — the new version and
 that version's [CHANGELOG.md](CHANGELOG.md) entry — once per release, so a
@@ -169,8 +176,10 @@ setup mode and waits for the form.
 | Command | What it does |
 |---|---|
 | *any plain text* | Search Prowlarr, show tappable results sorted by seeders |
+| 🔔 *(button)* | Subscribe to the search you just ran, no filters, new releases only |
+| 🗑 *(button)* | Reject a subscription grab: remove it from Transmission and delete its files |
 | `/sub <query> \| <filters>` | Create a subscription (filters optional) |
-| `/subs` | List subscriptions with filters, paused state, grab count |
+| `/subs` | List subscriptions with filters, paused state, grab count, cutoff date |
 | `/unsub <id>` | Remove a subscription |
 | `/pause <id>` | Pause or resume a subscription |
 | `/test <id>` | Dry-run: show what WOULD match right now, download nothing |
@@ -257,9 +266,17 @@ against the release title:
 | `-/regex/` | excluded regex | `-/cam\|ts/` |
 | `>N gb/mb` | minimum size | `>1gb` |
 | `<N gb/mb` | maximum size | `<30gb` |
+| `backlog` | also grab what is already on the tracker | `backlog` |
 
 A release matches when **all** includes match, **no** excludes match, and its
 size is within bounds. An empty filter matches everything.
+
+`backlog` is not a title pattern — it is a setting on the subscription. By
+default a subscription ignores anything published before it was created, which
+is what makes "watch for new episodes" work without dragging in the whole
+season; `backlog` turns that off. Releases whose indexer publishes no date at
+all are skipped on the subscription's very first tick and taken from then on,
+so a dateless tracker neither floods the chat nor goes silent forever.
 
 ```
 /sub space show 2026 | rus, 1080p, x265, -720p, <30gb

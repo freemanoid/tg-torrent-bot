@@ -21,6 +21,11 @@ var ErrNotFound = errors.New("store: not found")
 const (
 	StatusActive = "active"
 	StatusDone   = "done"
+	// StatusCancelled is a download the user rejected after the bot grabbed it
+	// on its own. The row is kept rather than deleted so the title stays out of
+	// both the active list and the completed history, and so a later re-add can
+	// tell "rejected before" from "never seen".
+	StatusCancelled = "cancelled"
 )
 
 // timeFormat is how timestamps are stored in TEXT columns.
@@ -38,6 +43,10 @@ type Subscription struct {
 	Grabs         int64
 	CreatedAt     time.Time
 	LastCheckedAt time.Time // zero = never checked
+	// CutoffAt skips releases published before it, which is how a subscription
+	// means "only what shows up from now on". Zero = no cutoff, i.e. the whole
+	// backlog is fair game.
+	CutoffAt time.Time
 }
 
 // Download is a torrent the bot handed to Transmission.
@@ -139,11 +148,12 @@ func (s *Store) CreateSubscription(ctx context.Context, sub Subscription) (Subsc
 	}
 
 	res, err := s.db.ExecContext(ctx, `
-		INSERT INTO subscriptions (query, include, exclude, min_size_mb, max_size_mb, paused, grabs, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		INSERT INTO subscriptions (query, include, exclude, min_size_mb, max_size_mb, paused, grabs, created_at, cutoff_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		sub.Query, include, exclude,
 		nullableInt(sub.MinSizeMB), nullableInt(sub.MaxSizeMB),
 		boolToInt(sub.Paused), sub.Grabs, sub.CreatedAt.Format(timeFormat),
+		nullableTime(sub.CutoffAt),
 	)
 	if err != nil {
 		return Subscription{}, fmt.Errorf("create subscription: %w", err)
@@ -158,7 +168,7 @@ func (s *Store) CreateSubscription(ctx context.Context, sub Subscription) (Subsc
 func (s *Store) GetSubscription(ctx context.Context, id int64) (Subscription, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, query, include, exclude, COALESCE(min_size_mb, 0), COALESCE(max_size_mb, 0),
-		       paused, grabs, created_at, COALESCE(last_checked_at, '')
+		       paused, grabs, created_at, COALESCE(last_checked_at, ''), COALESCE(cutoff_at, '')
 		FROM subscriptions WHERE id = ?`, id)
 	sub, err := scanSubscription(row.Scan)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -174,7 +184,7 @@ func (s *Store) GetSubscription(ctx context.Context, id int64) (Subscription, er
 func (s *Store) ListSubscriptions(ctx context.Context) ([]Subscription, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, query, include, exclude, COALESCE(min_size_mb, 0), COALESCE(max_size_mb, 0),
-		       paused, grabs, created_at, COALESCE(last_checked_at, '')
+		       paused, grabs, created_at, COALESCE(last_checked_at, ''), COALESCE(cutoff_at, '')
 		FROM subscriptions ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("list subscriptions: %w", err)
@@ -269,8 +279,9 @@ func (s *Store) IsSeen(ctx context.Context, subID int64, guid string) (bool, err
 
 // AddDownload records a torrent handed to Transmission with status active.
 // Adding a hash whose row is still active is a no-op; adding a hash whose row
-// is already done re-activates it (the user re-downloaded something that had
-// finished before, and should get a fresh completion notification).
+// is done or cancelled re-activates it (the user re-downloaded something they
+// had finished or rejected before, and should get a fresh completion
+// notification either way).
 func (s *Store) AddDownload(ctx context.Context, hash, title, source string) error {
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO downloads (hash, title, source, status, added_at)
@@ -280,8 +291,9 @@ func (s *Store) AddDownload(ctx context.Context, hash, title, source string) err
 			source = excluded.source,
 			status = excluded.status,
 			added_at = excluded.added_at
-		WHERE downloads.status = ?`,
-		hash, title, source, StatusActive, time.Now().UTC().Format(timeFormat), StatusDone)
+		WHERE downloads.status IN (?, ?)`,
+		hash, title, source, StatusActive, time.Now().UTC().Format(timeFormat),
+		StatusDone, StatusCancelled)
 	if err != nil {
 		return fmt.Errorf("add download %s: %w", hash, err)
 	}
@@ -370,16 +382,46 @@ func (s *Store) RecentCompleted(ctx context.Context, limit int) ([]Download, err
 	return dls, nil
 }
 
-// CompleteDownload marks the download with the given hash as done.
-// Completing an already-done download is a no-op; an unknown hash is ErrNotFound.
+// CompleteDownload marks the download with the given hash as done. Completing
+// an already-done download is a no-op; an unknown hash is ErrNotFound, and so
+// is a cancelled one — the watcher can be mid-cycle when the user rejects a
+// download, and finishing it afterwards would resurrect it into the history.
 func (s *Store) CompleteDownload(ctx context.Context, hash string) error {
-	res, err := s.db.ExecContext(ctx, "UPDATE downloads SET status = ? WHERE hash = ?", StatusDone, hash)
+	res, err := s.db.ExecContext(ctx,
+		"UPDATE downloads SET status = ? WHERE hash = ? AND status != ?",
+		StatusDone, hash, StatusCancelled)
 	if err != nil {
 		return fmt.Errorf("complete download %s: %w", hash, err)
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
 		return fmt.Errorf("complete download %s: %w", hash, err)
+	}
+	if n == 0 {
+		return fmt.Errorf("download %s: %w", hash, ErrNotFound)
+	}
+	return nil
+}
+
+// CancelDownload marks the download with the given hash as cancelled: the user
+// rejected a torrent the bot grabbed on its own. It works whether the download
+// is still running or already finished, since removing it from Transmission
+// deletes the data either way. An unknown hash is ErrNotFound, which is how a
+// second tap on a stale button in another chat is told the work is already done.
+func (s *Store) CancelDownload(ctx context.Context, hash string) error {
+	return s.setDownloadStatus(ctx, hash, StatusCancelled, "cancel")
+}
+
+// setDownloadStatus writes one download's status, mapping "no such row" to
+// ErrNotFound. verb names the operation in the error message.
+func (s *Store) setDownloadStatus(ctx context.Context, hash, status, verb string) error {
+	res, err := s.db.ExecContext(ctx, "UPDATE downloads SET status = ? WHERE hash = ?", status, hash)
+	if err != nil {
+		return fmt.Errorf("%s download %s: %w", verb, hash, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("%s download %s: %w", verb, hash, err)
 	}
 	if n == 0 {
 		return fmt.Errorf("download %s: %w", hash, ErrNotFound)
@@ -420,10 +462,10 @@ func placeholders(n int) string {
 // the SELECT lists in GetSubscription/ListSubscriptions.
 func scanSubscription(scan func(...any) error) (Subscription, error) {
 	var sub Subscription
-	var include, exclude, createdAt, lastChecked string
+	var include, exclude, createdAt, lastChecked, cutoff string
 	var paused int
 	err := scan(&sub.ID, &sub.Query, &include, &exclude, &sub.MinSizeMB, &sub.MaxSizeMB,
-		&paused, &sub.Grabs, &createdAt, &lastChecked)
+		&paused, &sub.Grabs, &createdAt, &lastChecked, &cutoff)
 	if err != nil {
 		return Subscription{}, err
 	}
@@ -442,6 +484,11 @@ func scanSubscription(scan func(...any) error) (Subscription, error) {
 			return Subscription{}, fmt.Errorf("parse last_checked_at: %w", err)
 		}
 	}
+	if cutoff != "" {
+		if sub.CutoffAt, err = time.Parse(timeFormat, cutoff); err != nil {
+			return Subscription{}, fmt.Errorf("parse cutoff_at: %w", err)
+		}
+	}
 	return sub, nil
 }
 
@@ -455,6 +502,15 @@ func marshalPatterns(patterns []string) (string, error) {
 		return "", err
 	}
 	return string(b), nil
+}
+
+// nullableTime maps the zero time to NULL, so "unset" reads back as the zero
+// time rather than as a parseable timestamp nobody chose.
+func nullableTime(t time.Time) any {
+	if t.IsZero() {
+		return nil
+	}
+	return t.UTC().Format(timeFormat)
 }
 
 // nullableInt maps 0 to NULL to match the nullable schema columns.

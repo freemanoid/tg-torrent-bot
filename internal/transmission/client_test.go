@@ -418,3 +418,96 @@ func TestNewBadURL(t *testing.T) {
 		}
 	}
 }
+
+func TestRemoveTorrentResolvesHashAndDeletesData(t *testing.T) {
+	var gotIDs []any
+	var gotDelete any
+	c, fake := newFake(t, func(t *testing.T, method string, args map[string]any) (string, any) {
+		switch method {
+		case "torrent-get":
+			ids, _ := args["ids"].([]any)
+			if len(ids) != 1 || ids[0] != "abc123" {
+				t.Errorf("torrent-get ids = %v, want [abc123]", args["ids"])
+			}
+			return "success", map[string]any{
+				"torrents": []any{map[string]any{"id": 42, "hashString": "abc123"}},
+			}
+		case "torrent-remove":
+			gotIDs, _ = args["ids"].([]any)
+			gotDelete = args["delete-local-data"]
+			return "success", nil
+		default:
+			t.Errorf("unexpected method %q", method)
+			return "unexpected method", nil
+		}
+	})
+
+	if err := c.RemoveTorrent(context.Background(), "abc123"); err != nil {
+		t.Fatalf("RemoveTorrent = %v", err)
+	}
+	if len(gotIDs) != 1 || gotIDs[0] != float64(42) {
+		t.Errorf("torrent-remove ids = %v, want [42]", gotIDs)
+	}
+	if gotDelete != true {
+		t.Errorf("delete-local-data = %v, want true", gotDelete)
+	}
+	if got := fake.calls.Load(); got != 2 {
+		t.Errorf("served %d RPC calls, want 2 (get + remove)", got)
+	}
+}
+
+// A torrent Transmission no longer has is not a failure to report as one: the
+// button that triggers this lives in every allowed chat, so the second tap
+// must be able to say "already removed".
+func TestRemoveTorrentUnknownHash(t *testing.T) {
+	c, _ := newFake(t, func(t *testing.T, method string, args map[string]any) (string, any) {
+		if method != "torrent-get" {
+			t.Errorf("unexpected method %q after an empty torrent-get", method)
+		}
+		return "success", map[string]any{"torrents": []any{}}
+	})
+
+	if err := c.RemoveTorrent(context.Background(), "nope"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("RemoveTorrent(unknown) = %v, want ErrNotFound", err)
+	}
+}
+
+func TestRemoveTorrentEmptyHash(t *testing.T) {
+	c, fake := newFake(t, func(t *testing.T, method string, args map[string]any) (string, any) {
+		t.Errorf("unexpected RPC call %q for an empty hash", method)
+		return "success", nil
+	})
+	if err := c.RemoveTorrent(context.Background(), ""); err == nil {
+		t.Error("RemoveTorrent(\"\") succeeded, want error")
+	}
+	if got := fake.calls.Load(); got != 0 {
+		t.Errorf("served %d RPC calls, want 0", got)
+	}
+}
+
+func TestRemoveTorrentLookupFailure(t *testing.T) {
+	c, _ := newFake(t, func(t *testing.T, method string, args map[string]any) (string, any) {
+		return "nope, broken", nil
+	})
+	err := c.RemoveTorrent(context.Background(), "abc123")
+	if err == nil {
+		t.Fatal("RemoveTorrent with failing torrent-get succeeded, want error")
+	}
+	if errors.Is(err, ErrNotFound) {
+		t.Errorf("RemoveTorrent = %v, want a real error rather than ErrNotFound", err)
+	}
+}
+
+func TestRemoveTorrentRemoveFailure(t *testing.T) {
+	c, _ := newFake(t, func(t *testing.T, method string, args map[string]any) (string, any) {
+		if method == "torrent-get" {
+			return "success", map[string]any{
+				"torrents": []any{map[string]any{"id": 42, "hashString": "abc123"}},
+			}
+		}
+		return "nope, broken", nil
+	})
+	if err := c.RemoveTorrent(context.Background(), "abc123"); err == nil {
+		t.Fatal("RemoveTorrent with failing torrent-remove succeeded, want error")
+	}
+}

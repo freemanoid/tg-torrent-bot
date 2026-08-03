@@ -849,3 +849,206 @@ func TestFreshDatabaseFalseForPartiallyMigratedDatabase(t *testing.T) {
 		t.Errorf("SetMeta after upgrade = %v, want the meta table to exist", err)
 	}
 }
+
+func TestSubscriptionCutoffRoundTrip(t *testing.T) {
+	s := openMem(t)
+	ctx := context.Background()
+
+	cutoff := time.Date(2026, 8, 3, 12, 30, 0, 0, time.UTC)
+	created, err := s.CreateSubscription(ctx, Subscription{Query: "space show", CutoffAt: cutoff})
+	if err != nil {
+		t.Fatalf("CreateSubscription = %v", err)
+	}
+	if !created.CutoffAt.Equal(cutoff) {
+		t.Errorf("created.CutoffAt = %v, want %v", created.CutoffAt, cutoff)
+	}
+
+	got, err := s.GetSubscription(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("GetSubscription = %v", err)
+	}
+	if !got.CutoffAt.Equal(cutoff) {
+		t.Errorf("GetSubscription CutoffAt = %v, want %v", got.CutoffAt, cutoff)
+	}
+
+	list, err := s.ListSubscriptions(ctx)
+	if err != nil {
+		t.Fatalf("ListSubscriptions = %v", err)
+	}
+	if len(list) != 1 || !list[0].CutoffAt.Equal(cutoff) {
+		t.Errorf("ListSubscriptions CutoffAt = %v, want %v", list, cutoff)
+	}
+}
+
+func TestSubscriptionWithoutCutoffStaysZero(t *testing.T) {
+	s := openMem(t)
+	ctx := context.Background()
+
+	created, err := s.CreateSubscription(ctx, Subscription{Query: "space show"})
+	if err != nil {
+		t.Fatalf("CreateSubscription = %v", err)
+	}
+	got, err := s.GetSubscription(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("GetSubscription = %v", err)
+	}
+	if !got.CutoffAt.IsZero() {
+		t.Errorf("CutoffAt = %v, want zero (no cutoff)", got.CutoffAt)
+	}
+}
+
+// Subscriptions that predate the cutoff column must keep grabbing everything
+// they match: a retroactive cutoff would permanently strand older releases
+// that maxGrabsPerTick had deferred to a later tick.
+func TestCutoffZeroForSubscriptionsPredatingMigration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bot.db")
+
+	db, err := sql.Open("sqlite", path+dsnPragmas)
+	if err != nil {
+		t.Fatalf("sql.Open = %v", err)
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := db.Exec(migrations[i]); err != nil {
+			t.Fatalf("apply migration %d: %v", i+1, err)
+		}
+	}
+	if _, err := db.Exec("PRAGMA user_version = 2"); err != nil {
+		t.Fatalf("set user_version: %v", err)
+	}
+	if _, err := db.Exec(
+		`INSERT INTO subscriptions (query, created_at) VALUES ('old sub', ?)`,
+		time.Now().UTC().Add(-90*24*time.Hour).Format(timeFormat)); err != nil {
+		t.Fatalf("insert legacy subscription: %v", err)
+	}
+	db.Close()
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open = %v", err)
+	}
+	defer s.Close()
+
+	subs, err := s.ListSubscriptions(context.Background())
+	if err != nil {
+		t.Fatalf("ListSubscriptions = %v", err)
+	}
+	if len(subs) != 1 {
+		t.Fatalf("got %d subscriptions, want 1", len(subs))
+	}
+	if !subs[0].CutoffAt.IsZero() {
+		t.Errorf("legacy subscription CutoffAt = %v, want zero", subs[0].CutoffAt)
+	}
+}
+
+func TestCancelDownload(t *testing.T) {
+	s := openMem(t)
+	ctx := context.Background()
+
+	if err := s.AddDownload(ctx, "hash1", "Space Show S01E01", "sub:1"); err != nil {
+		t.Fatalf("AddDownload = %v", err)
+	}
+	if err := s.CancelDownload(ctx, "hash1"); err != nil {
+		t.Fatalf("CancelDownload = %v", err)
+	}
+
+	active, err := s.ActiveDownloads(ctx)
+	if err != nil {
+		t.Fatalf("ActiveDownloads = %v", err)
+	}
+	if len(active) != 0 {
+		t.Errorf("ActiveDownloads = %v, want none after cancel", active)
+	}
+	done, err := s.RecentCompleted(ctx, 10)
+	if err != nil {
+		t.Fatalf("RecentCompleted = %v", err)
+	}
+	if len(done) != 0 {
+		t.Errorf("RecentCompleted = %v, want none after cancel", done)
+	}
+
+	found, err := s.FindDownloads(ctx, []string{"hash1"}, nil)
+	if err != nil {
+		t.Fatalf("FindDownloads = %v", err)
+	}
+	if len(found) != 1 || found[0].Status != StatusCancelled {
+		t.Errorf("FindDownloads = %v, want one row with status %q", found, StatusCancelled)
+	}
+}
+
+func TestCancelDownloadAfterCompletion(t *testing.T) {
+	s := openMem(t)
+	ctx := context.Background()
+
+	if err := s.AddDownload(ctx, "hash1", "Space Show S01E01", "sub:1"); err != nil {
+		t.Fatalf("AddDownload = %v", err)
+	}
+	if err := s.CompleteDownload(ctx, "hash1"); err != nil {
+		t.Fatalf("CompleteDownload = %v", err)
+	}
+	if err := s.CancelDownload(ctx, "hash1"); err != nil {
+		t.Fatalf("CancelDownload after completion = %v", err)
+	}
+	done, err := s.RecentCompleted(ctx, 10)
+	if err != nil {
+		t.Fatalf("RecentCompleted = %v", err)
+	}
+	if len(done) != 0 {
+		t.Errorf("RecentCompleted = %v, want none after cancelling a finished download", done)
+	}
+}
+
+func TestCancelDownloadUnknownHash(t *testing.T) {
+	s := openMem(t)
+	if err := s.CancelDownload(context.Background(), "nope"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("CancelDownload(unknown) = %v, want ErrNotFound", err)
+	}
+}
+
+// A release the user cancelled must still be re-downloadable by hand, with a
+// fresh completion notification — same as re-downloading a finished one.
+func TestAddDownloadReactivatesCancelledRow(t *testing.T) {
+	s := openMem(t)
+	ctx := context.Background()
+
+	if err := s.AddDownload(ctx, "hash1", "Space Show S01E01", "sub:1"); err != nil {
+		t.Fatalf("AddDownload = %v", err)
+	}
+	if err := s.CancelDownload(ctx, "hash1"); err != nil {
+		t.Fatalf("CancelDownload = %v", err)
+	}
+	if err := s.AddDownload(ctx, "hash1", "Space Show S01E01", "search"); err != nil {
+		t.Fatalf("AddDownload after cancel = %v", err)
+	}
+
+	active, err := s.ActiveDownloads(ctx)
+	if err != nil {
+		t.Fatalf("ActiveDownloads = %v", err)
+	}
+	if len(active) != 1 || active[0].Status != StatusActive {
+		t.Errorf("ActiveDownloads = %v, want the cancelled row re-activated", active)
+	}
+}
+
+// The watcher can already hold a download in its cycle when the user rejects
+// it; finishing it afterwards must not put it back into the history.
+func TestCompleteDownloadWillNotResurrectCancelled(t *testing.T) {
+	s := openMem(t)
+	ctx := context.Background()
+
+	if err := s.AddDownload(ctx, "hash1", "Space Show S01E01", "sub:1"); err != nil {
+		t.Fatalf("AddDownload = %v", err)
+	}
+	if err := s.CancelDownload(ctx, "hash1"); err != nil {
+		t.Fatalf("CancelDownload = %v", err)
+	}
+	if err := s.CompleteDownload(ctx, "hash1"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("CompleteDownload(cancelled) = %v, want ErrNotFound", err)
+	}
+	found, err := s.FindDownloads(ctx, []string{"hash1"}, nil)
+	if err != nil {
+		t.Fatalf("FindDownloads = %v", err)
+	}
+	if len(found) != 1 || found[0].Status != StatusCancelled {
+		t.Errorf("FindDownloads = %v, want the row still cancelled", found)
+	}
+}

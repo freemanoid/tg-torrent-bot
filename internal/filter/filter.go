@@ -19,6 +19,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // mb is one mebibyte in bytes.
@@ -33,6 +34,12 @@ type Filter struct {
 	Exclude   []string // no pattern may match the title
 	MinSizeMB int64    // 0 = no lower bound
 	MaxSizeMB int64    // 0 = no upper bound
+	// Since rejects releases published before it, which is how a subscription
+	// means "only what shows up from now on". Unlike every other field it has
+	// no token in the filter syntax: Parse never sets it and String never
+	// renders it. It lives here so that the engine and the /test dry run share
+	// one predicate and cannot disagree about what a subscription will grab.
+	Since time.Time
 }
 
 // Parse converts a filter-syntax string (the part after "|" in /sub) into a
@@ -76,11 +83,19 @@ func Parse(s string) (Filter, error) {
 	return f, nil
 }
 
-// Match reports whether a release with the given title and size passes the
-// filter. Matching is case-insensitive (including Cyrillic). A sizeBytes of 0
-// (unknown) fails any lower bound but passes an upper bound. Size bounds are
-// strict, mirroring the > / < syntax.
-func (f Filter) Match(title string, sizeBytes int64) bool {
+// Match reports whether a release with the given title, size and publish date
+// passes the filter. Matching is case-insensitive (including Cyrillic). A
+// sizeBytes of 0 (unknown) fails any lower bound but passes an upper bound.
+// Size bounds are strict, mirroring the > / < syntax.
+//
+// A zero published (an indexer that reported no date) passes any Since bound:
+// failing it closed would leave a subscription silently grabbing nothing
+// forever. Callers that need those releases held back — the engine, on a
+// subscription's first tick — handle them themselves.
+func (f Filter) Match(title string, sizeBytes int64, published time.Time) bool {
+	if !f.Since.IsZero() && !published.IsZero() && published.Before(f.Since) {
+		return false
+	}
 	lower := strings.ToLower(title)
 	for _, pat := range f.Include {
 		if !patternMatches(pat, lower) {
@@ -103,6 +118,8 @@ func (f Filter) Match(title string, sizeBytes int64) bool {
 
 // String renders the filter back in filter syntax, suitable for showing a
 // subscription to the user and for re-parsing. The zero Filter renders as "".
+// Since is deliberately absent: it has no token, so rendering it would produce
+// a string Parse cannot read back.
 func (f Filter) String() string {
 	parts := make([]string, 0, len(f.Include)+len(f.Exclude)+2)
 	parts = append(parts, f.Include...)

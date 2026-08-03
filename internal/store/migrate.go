@@ -45,6 +45,12 @@ CREATE TABLE meta (
   value TEXT NOT NULL
 );
 `,
+	// NULL means "no cutoff", which is what every subscription created before
+	// this column existed keeps: those have already grabbed part of their
+	// backlog, and a retroactive cutoff would strand the rest forever.
+	`
+ALTER TABLE subscriptions ADD COLUMN cutoff_at TEXT;
+`,
 }
 
 // migrate applies any pending migrations, tracking progress in

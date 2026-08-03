@@ -4,6 +4,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParse(t *testing.T) {
@@ -274,7 +275,7 @@ func TestMatch(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Parse(%q) error = %v", tt.filter, err)
 			}
-			if got := f.Match(tt.title, tt.sizeBytes); got != tt.want {
+			if got := f.Match(tt.title, tt.sizeBytes, time.Time{}); got != tt.want {
 				t.Errorf("Parse(%q).Match(%q, %d) = %v, want %v",
 					tt.filter, tt.title, tt.sizeBytes, got, tt.want)
 			}
@@ -292,10 +293,10 @@ func TestMatchReconstructedFromStore(t *testing.T) {
 		MaxSizeMB: 30720,
 	}
 	title := "Космос [2026, WEB-DL 1080p, x265, Rus]"
-	if !f.Match(title, 4*gib) {
+	if !f.Match(title, 4*gib, time.Time{}) {
 		t.Errorf("Match(%q) = false, want true", title)
 	}
-	if f.Match("Space Show [2026, 720p, x265, Rus]", 4*gib) {
+	if f.Match("Space Show [2026, 720p, x265, Rus]", 4*gib, time.Time{}) {
 		t.Error("Match with excluded 720p = true, want false")
 	}
 }
@@ -304,11 +305,11 @@ func TestMatchReconstructedFromStore(t *testing.T) {
 // must fail closed (include never satisfied) instead of panicking.
 func TestMatchInvalidRegexNeverMatches(t *testing.T) {
 	f := Filter{Include: []string{"/[/"}}
-	if f.Match("anything", 0) {
+	if f.Match("anything", 0, time.Time{}) {
 		t.Error("Match with invalid include regex = true, want false")
 	}
 	f = Filter{Exclude: []string{"/[/"}}
-	if !f.Match("anything", 0) {
+	if !f.Match("anything", 0, time.Time{}) {
 		t.Error("Match with invalid exclude regex = false, want true (exclude ignored)")
 	}
 }
@@ -362,5 +363,62 @@ func TestParseStringRoundTrip(t *testing.T) {
 	}
 	if !reflect.DeepEqual(f1, f2) {
 		t.Errorf("round trip mismatch: %+v != %+v", f1, f2)
+	}
+}
+
+func TestMatchSinceCutoff(t *testing.T) {
+	cutoff := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name      string
+		since     time.Time
+		published time.Time
+		want      bool
+	}{
+		{"no cutoff lets anything through", time.Time{}, cutoff.Add(-365 * 24 * time.Hour), true},
+		{"published after the cutoff", cutoff, cutoff.Add(time.Hour), true},
+		{"published exactly at the cutoff", cutoff, cutoff, true},
+		{"published before the cutoff", cutoff, cutoff.Add(-time.Second), false},
+		// An indexer that reports no date must not silently kill the
+		// subscription; the engine decides what to do with these instead.
+		{"undated release passes the cutoff", cutoff, time.Time{}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := Filter{Since: tt.since}
+			if got := f.Match("Space Show S01E01", 1<<30, tt.published); got != tt.want {
+				t.Errorf("Match(published=%v) with Since=%v = %v, want %v",
+					tt.published, tt.since, got, tt.want)
+			}
+		})
+	}
+}
+
+// Since is a subscription property rather than a filter token: Parse can never
+// produce it, so String must not render it or the round-trip would grow a
+// token that fails to parse.
+func TestStringOmitsSince(t *testing.T) {
+	f := Filter{Include: []string{"rus"}, Since: time.Now()}
+	if got := f.String(); got != "rus" {
+		t.Errorf("String() = %q, want %q", got, "rus")
+	}
+}
+
+// Title and size rules still apply on top of the cutoff.
+func TestMatchSinceCombinesWithPatterns(t *testing.T) {
+	cutoff := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	f, err := Parse("rus, -720p")
+	if err != nil {
+		t.Fatalf("Parse = %v", err)
+	}
+	f.Since = cutoff
+
+	if f.Match("Space Show 720p Rus", 1<<30, cutoff.Add(time.Hour)) {
+		t.Error("excluded pattern matched despite passing the cutoff")
+	}
+	if f.Match("Space Show 1080p Rus", 1<<30, cutoff.Add(-time.Hour)) {
+		t.Error("release older than the cutoff matched despite passing the patterns")
+	}
+	if !f.Match("Space Show 1080p Rus", 1<<30, cutoff.Add(time.Hour)) {
+		t.Error("release passing both patterns and cutoff did not match")
 	}
 }

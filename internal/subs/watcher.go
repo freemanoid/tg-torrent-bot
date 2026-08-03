@@ -107,7 +107,16 @@ func (w *Watcher) finish(ctx context.Context, dl store.Download, st transmission
 	if title == "" {
 		title = st.Name
 	}
-	if err := w.notifier.Notify(ctx, fmt.Sprintf("✅ Finished:\n%s", title)); err != nil {
+	// Only what a subscription grabbed on its own gets an undo: a download the
+	// user chose from search results is one they already decided they wanted.
+	msg := fmt.Sprintf("✅ Finished:\n%s", title)
+	var err error
+	if strings.HasPrefix(dl.Source, subSourcePrefix) {
+		err = w.notifier.NotifyGrab(ctx, msg, dl.Hash)
+	} else {
+		err = w.notifier.Notify(ctx, msg)
+	}
+	if err != nil {
 		w.log.Error("notify finished download", "hash", dl.Hash, "error", err)
 		return
 	}

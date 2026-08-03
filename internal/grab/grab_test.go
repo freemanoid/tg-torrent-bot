@@ -44,6 +44,8 @@ func (f *fakeTrans) Active(context.Context) ([]transmission.TorrentStatus, error
 	return nil, nil
 }
 
+func (f *fakeTrans) RemoveTorrent(context.Context, string) error { return nil }
+
 var _ transmission.Interface = (*fakeTrans)(nil)
 
 func TestAddReleasePrefersTorrentFile(t *testing.T) {

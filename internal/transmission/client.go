@@ -22,6 +22,11 @@ const DefaultTimeout = 30 * time.Second
 // (Transmission serves RPC there by default).
 const defaultRPCPath = "/transmission/rpc"
 
+// ErrNotFound reports that Transmission has no torrent with the given hash.
+// Removing something that is already gone is the expected outcome of a second
+// tap on a stale button, not a failure worth surfacing as one.
+var ErrNotFound = errors.New("transmission: torrent not found")
+
 // Interface is the narrow surface the rest of the app depends on; fakes
 // implement it in tests of the subscription engine, watcher, and bot handlers.
 type Interface interface {
@@ -34,6 +39,10 @@ type Interface interface {
 	// Active returns the status of every torrent currently in Transmission
 	// (including finished ones); callers filter by hash.
 	Active(ctx context.Context) ([]TorrentStatus, error)
+	// RemoveTorrent deletes the torrent with the given info hash along with
+	// whatever it downloaded. A hash Transmission does not know yields
+	// ErrNotFound rather than a generic failure.
+	RemoveTorrent(ctx context.Context, hash string) error
 }
 
 // TorrentStatus is a snapshot of one torrent's download progress.
@@ -114,6 +123,32 @@ func (c *Client) add(ctx context.Context, payload transmissionrpc.TorrentAddPayl
 		return "", errors.New("transmission torrent-add: response has no info hash")
 	}
 	return *torrent.HashString, nil
+}
+
+// RemoveTorrent implements Interface. torrent-remove takes numeric torrent
+// ids rather than hashes in this client library, so the hash is resolved first
+// — which doubles as the existence check behind ErrNotFound.
+func (c *Client) RemoveTorrent(ctx context.Context, hash string) error {
+	if hash == "" {
+		return errors.New("empty info hash")
+	}
+	torrents, err := c.rpc.TorrentGetHashes(ctx, []string{"id"}, []string{hash})
+	if err != nil {
+		return fmt.Errorf("transmission torrent-get for %s: %w", hash, err)
+	}
+	if len(torrents) == 0 || torrents[0].ID == nil {
+		return fmt.Errorf("transmission: %s: %w", hash, ErrNotFound)
+	}
+	// Deleting the data is the point: the user rejected this release, and
+	// leaving a partial download behind would need an SSH session to clean up.
+	err = c.rpc.TorrentRemove(ctx, transmissionrpc.TorrentRemovePayload{
+		IDs:             []int64{*torrents[0].ID},
+		DeleteLocalData: true,
+	})
+	if err != nil {
+		return fmt.Errorf("transmission torrent-remove %s: %w", hash, err)
+	}
+	return nil
 }
 
 // activeFields is the subset of torrent-get fields TorrentStatus needs.

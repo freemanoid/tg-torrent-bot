@@ -2,9 +2,11 @@ package tgbot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
@@ -220,12 +222,28 @@ func (h *Handlers) HandleCallback(ctx context.Context, api telegramAPI, update *
 		h.log.Warn("answer callback query", "error", err)
 	}
 
-	kind, searchID, n, err := decodeCallback(cb.Data)
+	kind, ref, n, err := decodeCallback(cb.Data)
 	if err != nil {
 		h.log.Warn("bad callback data", "data", cb.Data)
 		return
 	}
-	entry, ok := h.cache.Get(searchID)
+
+	// The reject buttons ride on grab and completion notifications, which have
+	// no search behind them and are meant to stay usable for as long as the
+	// message exists — so they are routed before the cache is consulted at all.
+	switch kind {
+	case cbReject:
+		h.offerReject(ctx, api, cb, chatID, ref)
+		return
+	case cbRejectOK:
+		h.reject(ctx, api, cb, chatID, ref)
+		return
+	case cbRejectNo:
+		h.keepRejected(ctx, api, cb, chatID, ref)
+		return
+	}
+
+	entry, ok := h.cache.Get(ref)
 	if !ok {
 		h.reply(ctx, api, chatID, "That search has expired — please send the query again.")
 		return
@@ -233,14 +251,132 @@ func (h *Handlers) HandleCallback(ctx context.Context, api telegramAPI, update *
 
 	switch kind {
 	case cbPage:
-		h.flipPage(ctx, api, cb, chatID, searchID, entry, n)
+		h.flipPage(ctx, api, cb, chatID, ref, entry, n)
 	case cbDownload:
 		h.download(ctx, api, chatID, entry, n)
 	case cbInfo:
-		h.details(ctx, api, chatID, searchID, entry, n)
+		h.details(ctx, api, chatID, ref, entry, n)
+	case cbSub:
+		h.subscribeToSearch(ctx, api, chatID, entry)
 	default:
 		h.log.Warn("unknown callback kind", "data", cb.Data)
 	}
+}
+
+// subscribeToSearch turns the search behind the 🔔 button into a subscription:
+// the query exactly as it was typed, no filters, and a cutoff of now.
+//
+// The query is taken verbatim on purpose. Guessing which words name the series
+// and which name one episode is the kind of cleverness that fails silently on
+// whatever the guess did not anticipate; the user already knows which query
+// they meant, and can send /sub by hand to say something more precise.
+func (h *Handlers) subscribeToSearch(ctx context.Context, api telegramAPI, chatID int64, entry cachedSearch) {
+	sub, err := h.subs.CreateSubscription(ctx, store.Subscription{
+		Query:    entry.Query,
+		CutoffAt: time.Now().UTC(),
+	})
+	if err != nil {
+		h.reply(ctx, api, chatID, fmt.Sprintf("Failed to save subscription: %v", err))
+		return
+	}
+	h.reply(ctx, api, chatID, fmt.Sprintf(
+		"🔔 Subscribed #%d: «%s»\nNew releases from now on will download by themselves. "+
+			"Anything already on the tracker is left alone — tap ⬇️ for those.",
+		sub.ID, sub.Query))
+}
+
+// offerReject swaps a grab notification's keyboard for a confirmation. Only
+// the keyboard changes: the message still names the release, so the question
+// needs no restatement, and abandoning the confirmation restores the original
+// button without having to reconstruct any text.
+func (h *Handlers) offerReject(ctx context.Context, api telegramAPI, cb *models.CallbackQuery, chatID int64, hash string) {
+	h.swapKeyboard(ctx, api, cb, chatID, rejectConfirmKeyboard(hash),
+		"Delete this download and the files it has already written?")
+}
+
+// keepRejected abandons the confirmation, restoring the plain reject button.
+func (h *Handlers) keepRejected(ctx context.Context, api telegramAPI, cb *models.CallbackQuery, chatID int64, hash string) {
+	h.swapKeyboard(ctx, api, cb, chatID, rejectKeyboard(hash), "")
+}
+
+// swapKeyboard replaces the keyboard on the message a callback came from,
+// leaving its text alone. fallback is sent as a new message when the original
+// is unavailable — an empty fallback means the swap was cosmetic enough to
+// skip silently rather than clutter the chat.
+func (h *Handlers) swapKeyboard(ctx context.Context, api telegramAPI, cb *models.CallbackQuery, chatID int64, kb *models.InlineKeyboardMarkup, fallback string) {
+	if msg := cb.Message.Message; msg != nil && msg.Text != "" {
+		_, err := api.EditMessageText(ctx, &bot.EditMessageTextParams{
+			ChatID:      chatID,
+			MessageID:   msg.ID,
+			Text:        msg.Text,
+			ReplyMarkup: kb,
+		})
+		if err == nil {
+			return
+		}
+		h.log.Warn("swap notification keyboard", "error", err)
+	}
+	if fallback == "" {
+		return
+	}
+	if _, err := api.SendMessage(ctx, &bot.SendMessageParams{
+		ChatID: chatID, Text: fallback, ReplyMarkup: kb,
+	}); err != nil {
+		h.log.Error("send reject confirmation", "error", err)
+	}
+}
+
+// reject removes a rejected download from Transmission along with its data and
+// closes out its store row. The seen row is deliberately left in place: the
+// user said no, so the subscription must not grab the same release again on
+// the next tick.
+//
+// Every allowed chat holds its own copy of the button, so a torrent that is
+// already gone is the expected second tap, not a failure.
+func (h *Handlers) reject(ctx context.Context, api telegramAPI, cb *models.CallbackQuery, chatID int64, hash string) {
+	err := h.trans.RemoveTorrent(ctx, hash)
+	switch {
+	case errors.Is(err, transmission.ErrNotFound):
+		h.swapKeyboard(ctx, api, cb, chatID, clearedKeyboard(), "")
+		h.reply(ctx, api, chatID, "🗑 Already removed.")
+		return
+	case err != nil:
+		h.reply(ctx, api, chatID, fmt.Sprintf("Failed to remove the download: %v", err))
+		return
+	}
+
+	// Transmission no longer has it, so the row must not stay active or the
+	// watcher would keep polling for something that will never finish.
+	if err := h.subs.CancelDownload(ctx, hash); err != nil && !errors.Is(err, store.ErrNotFound) {
+		h.log.Error("cancel download", "hash", hash, "error", err)
+	}
+	h.swapKeyboard(ctx, api, cb, chatID, clearedKeyboard(), "")
+	h.reply(ctx, api, chatID, "🗑 Removed, and the downloaded files are deleted.")
+}
+
+// clearedKeyboard is an explicitly empty keyboard, used once a notification
+// has been acted on so the same message cannot be acted on twice. An empty
+// markup removes the buttons; a nil one would leave whatever is there.
+func clearedKeyboard() *models.InlineKeyboardMarkup {
+	return &models.InlineKeyboardMarkup{InlineKeyboard: [][]models.InlineKeyboardButton{}}
+}
+
+// rejectKeyboard is the undo offered on a grab notification.
+func rejectKeyboard(hash string) *models.InlineKeyboardMarkup {
+	return &models.InlineKeyboardMarkup{InlineKeyboard: [][]models.InlineKeyboardButton{{{
+		Text:         "🗑 Not this one",
+		CallbackData: encodeCallback(cbReject, hash, 0),
+	}}}}
+}
+
+// rejectConfirmKeyboard asks before deleting: the button sits in the chat
+// history forever, and a stray tap weeks later must not destroy something the
+// user has since watched.
+func rejectConfirmKeyboard(hash string) *models.InlineKeyboardMarkup {
+	return &models.InlineKeyboardMarkup{InlineKeyboard: [][]models.InlineKeyboardButton{{
+		{Text: "🗑 Yes, delete", CallbackData: encodeCallback(cbRejectOK, hash, 0)},
+		{Text: "↩️ Keep", CallbackData: encodeCallback(cbRejectNo, hash, 0)},
+	}}}
 }
 
 // flipPage swaps the result message's keyboard (and header) to another page.
@@ -432,7 +568,12 @@ func resultsKeyboard(searchID string, releases []prowlarr.Release, page int, mar
 		rows = append(rows, links)
 	}
 
-	var nav []models.InlineKeyboardButton
+	// 🔔 belongs to the query rather than to any one release, so it sits once
+	// in the nav row instead of beside every result.
+	nav := []models.InlineKeyboardButton{{
+		Text:         "🔔 Subscribe",
+		CallbackData: encodeCallback(cbSub, searchID, 0),
+	}}
 	if page > 0 {
 		nav = append(nav, models.InlineKeyboardButton{
 			Text:         "⏮ Prev",
@@ -445,8 +586,6 @@ func resultsKeyboard(searchID string, releases []prowlarr.Release, page int, mar
 			CallbackData: encodeCallback(cbPage, searchID, page+1),
 		})
 	}
-	if len(nav) > 0 {
-		rows = append(rows, nav)
-	}
+	rows = append(rows, nav)
 	return &models.InlineKeyboardMarkup{InlineKeyboard: rows}
 }

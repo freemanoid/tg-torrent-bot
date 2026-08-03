@@ -5,6 +5,23 @@ the binary: after an update the bot posts the entry matching the version it is
 running, so keep entries short, plain, and headed `## v<version>` — the same
 version the git tag carries.
 
+## v1.9.0
+
+- Subscribing is now one tap: under any search results there is a 🔔 button
+  that watches that exact search. No filter syntax, no retyping — send the
+  query you mean, then tap.
+- New subscriptions only grab releases published **after** you created them.
+  Subscribe partway through a series and you get the next episode and every
+  one after it, not the whole back catalogue. Add the `backlog` filter when
+  you do want what is already on the tracker. Subscriptions you already have
+  are untouched and keep grabbing as before.
+- Every torrent a subscription grabs by itself now comes with a 🗑 button, on
+  the "grabbed" message and on the "finished" one. Tap it and confirm, and the
+  bot removes the torrent from Transmission and deletes what it downloaded.
+  The subscription will not grab that release again.
+- `/subs` shows each subscription's cutoff date, and `/test` now judges
+  releases exactly as the subscription will.
+
 ## v1.8.0
 
 - The settings page now takes a list of allowed chat IDs, not just one, so the

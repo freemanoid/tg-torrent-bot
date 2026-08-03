@@ -41,6 +41,8 @@ type fakeSubStore struct {
 	findErr    error
 	doneErr    error
 	addDLErr   error
+	cancelled  []string
+	cancelErr  error
 }
 
 func newFakeSubStore(subs ...store.Subscription) *fakeSubStore {
@@ -59,6 +61,14 @@ func (f *fakeSubStore) CreateSubscription(_ context.Context, sub store.Subscript
 	f.created = append(f.created, sub)
 	f.subs[sub.ID] = sub
 	return sub, nil
+}
+
+func (f *fakeSubStore) CancelDownload(_ context.Context, hash string) error {
+	if f.cancelErr != nil {
+		return f.cancelErr
+	}
+	f.cancelled = append(f.cancelled, hash)
+	return nil
 }
 
 func (f *fakeSubStore) GetSubscription(_ context.Context, id int64) (store.Subscription, error) {
@@ -945,5 +955,137 @@ func TestHumanETA(t *testing.T) {
 		if got := humanETA(tt.eta); got != tt.want {
 			t.Errorf("humanETA(%v) = %q, want %q", tt.eta, got, tt.want)
 		}
+	}
+}
+
+// --- subscription cutoff ---
+
+func TestCmdSubDefaultsToFutureOnly(t *testing.T) {
+	h, subs := newTestHandlers(&fakeSearcher{}, &fakeTrans{})
+	tg := &fakeTG{}
+
+	before := time.Now().UTC()
+	h.handleCommand(context.Background(), tg, testChatID, "/sub space show 2026 | rus, 1080p")
+
+	if len(subs.created) != 1 {
+		t.Fatalf("created %d subscriptions, want 1", len(subs.created))
+	}
+	got := subs.created[0]
+	if got.CutoffAt.Before(before) {
+		t.Errorf("cutoff = %v, want roughly now (%v)", got.CutoffAt, before)
+	}
+	if !slices.Equal(got.Include, []string{"rus", "1080p"}) {
+		t.Errorf("include = %v, want [rus 1080p]", got.Include)
+	}
+	if text := tg.lastSentText(t); !strings.Contains(text, "onward") {
+		t.Errorf("confirmation %q must state the cutoff", text)
+	}
+}
+
+// backlog is a subscription setting, not a title pattern: leaving it in the
+// filter list would turn it into a required substring matching nothing.
+func TestCmdSubBacklogTokenClearsCutoffAndIsNotAFilter(t *testing.T) {
+	h, subs := newTestHandlers(&fakeSearcher{}, &fakeTrans{})
+	tg := &fakeTG{}
+
+	h.handleCommand(context.Background(), tg, testChatID, "/sub the wire | 1080p, backlog, -720p")
+
+	if len(subs.created) != 1 {
+		t.Fatalf("created %d subscriptions, want 1", len(subs.created))
+	}
+	got := subs.created[0]
+	if !got.CutoffAt.IsZero() {
+		t.Errorf("cutoff = %v, want zero with the backlog token", got.CutoffAt)
+	}
+	if !slices.Equal(got.Include, []string{"1080p"}) {
+		t.Errorf("include = %v, want [1080p] — backlog must not become a pattern", got.Include)
+	}
+	if !slices.Equal(got.Exclude, []string{"720p"}) {
+		t.Errorf("exclude = %v, want [720p]", got.Exclude)
+	}
+	if text := tg.lastSentText(t); !strings.Contains(text, "including older releases") {
+		t.Errorf("confirmation %q must state that the backlog is included", text)
+	}
+}
+
+func TestCmdSubBacklogTokenIsCaseInsensitive(t *testing.T) {
+	h, subs := newTestHandlers(&fakeSearcher{}, &fakeTrans{})
+	tg := &fakeTG{}
+
+	h.handleCommand(context.Background(), tg, testChatID, "/sub the wire | BackLog")
+
+	if len(subs.created) != 1 {
+		t.Fatalf("created %d subscriptions, want 1", len(subs.created))
+	}
+	if !subs.created[0].CutoffAt.IsZero() {
+		t.Errorf("cutoff = %v, want zero", subs.created[0].CutoffAt)
+	}
+	if len(subs.created[0].Include) != 0 {
+		t.Errorf("include = %v, want none", subs.created[0].Include)
+	}
+}
+
+// A release whose title happens to contain the word is a different thing from
+// the token standing on its own.
+func TestCmdSubBacklogInsideAPatternStaysAFilter(t *testing.T) {
+	h, subs := newTestHandlers(&fakeSearcher{}, &fakeTrans{})
+	tg := &fakeTG{}
+
+	h.handleCommand(context.Background(), tg, testChatID, "/sub docs | backlog show")
+
+	if len(subs.created) != 1 {
+		t.Fatalf("created %d subscriptions, want 1", len(subs.created))
+	}
+	got := subs.created[0]
+	if !slices.Equal(got.Include, []string{"backlog show"}) {
+		t.Errorf("include = %v, want [backlog show]", got.Include)
+	}
+	if got.CutoffAt.IsZero() {
+		t.Error("cutoff = zero, want the default cutoff — the token was part of a pattern")
+	}
+}
+
+func TestSubsListShowsCutoff(t *testing.T) {
+	cutoff := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	h, _ := newTestHandlers(&fakeSearcher{}, &fakeTrans{})
+	h.subs = newFakeSubStore(
+		store.Subscription{ID: 1, Query: "space show", CutoffAt: cutoff},
+		store.Subscription{ID: 2, Query: "the wire"},
+	)
+	tg := &fakeTG{}
+
+	h.handleCommand(context.Background(), tg, testChatID, "/subs")
+
+	text := tg.lastSentText(t)
+	if !strings.Contains(text, "from: 2026-08-03") {
+		t.Errorf("/subs output must show the cutoff date:\n%s", text)
+	}
+	if !strings.Contains(text, "backlog included") {
+		t.Errorf("/subs output must show that a cutoff-less subscription takes the backlog:\n%s", text)
+	}
+}
+
+// The dry run and the engine must agree about what a subscription will grab,
+// or /test stops being worth running.
+func TestCmdTestAppliesTheCutoff(t *testing.T) {
+	cutoff := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	s := &fakeSearcher{releases: []prowlarr.Release{
+		{GUID: "old", Title: "Космос 2026 Серия 10 [1080p]", Size: 2 << 30,
+			PublishDate: cutoff.Add(-24 * time.Hour)},
+		{GUID: "new", Title: "Космос 2026 Серия 11 [1080p]", Size: 2 << 30,
+			PublishDate: cutoff.Add(24 * time.Hour)},
+	}}
+	h, _ := newTestHandlers(s, &fakeTrans{})
+	h.subs = newFakeSubStore(store.Subscription{ID: 1, Query: "space show", CutoffAt: cutoff})
+	tg := &fakeTG{}
+
+	h.handleCommand(context.Background(), tg, testChatID, "/test 1")
+
+	text := tg.lastSentText(t)
+	if !strings.Contains(text, "1 of 2 results match") {
+		t.Errorf("dry run must count only what the engine would grab:\n%s", text)
+	}
+	if strings.Contains(text, "Серия 10") {
+		t.Errorf("dry run listed a release older than the cutoff:\n%s", text)
 	}
 }

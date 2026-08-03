@@ -29,11 +29,19 @@ const maxMessageUnits = 4000
 // blockIndent aligns a result's detail lines under its numbered title.
 const blockIndent = "   "
 
-// Callback-data kinds (first segment of "<kind>:<searchID>:<n>").
+// Callback-data kinds (first segment of "<kind>:<ref>:<n>"). For most kinds
+// ref is a cached search's id; the reject kinds carry an info hash instead,
+// because the notification they sit on outlives any search — see
+// HandleCallback. A 40-character hash still leaves the whole payload well
+// inside Telegram's 64-byte cap on callback data.
 const (
-	cbDownload = "dl" // n = release index within the cached search
-	cbPage     = "pg" // n = keyboard page to show
-	cbInfo     = "if" // n = release index to describe in full
+	cbDownload = "dl" // ref = search, n = release index within it
+	cbPage     = "pg" // ref = search, n = keyboard page to show
+	cbInfo     = "if" // ref = search, n = release index to describe in full
+	cbSub      = "sb" // ref = search, n unused: subscribe to that search's query
+	cbReject   = "rj" // ref = info hash, n unused: offer to undo a grab
+	cbRejectOK = "ro" // ref = info hash, n unused: undo confirmed
+	cbRejectNo = "rn" // ref = info hash, n unused: undo abandoned
 )
 
 // Markers stating what the bot already did with a release. They reuse the
@@ -45,7 +53,9 @@ const (
 )
 
 // statusMark renders a stored download status as its marker, and nothing for a
-// status the store never writes.
+// status the store never writes. A cancelled download is deliberately
+// unmarked: the user rejected it and its data is gone, so showing it as
+// downloading or downloaded in a later search would be a lie.
 func statusMark(status string) string {
 	switch status {
 	case store.StatusActive:

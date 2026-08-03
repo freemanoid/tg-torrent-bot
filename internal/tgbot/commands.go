@@ -35,6 +35,9 @@ type SubscriptionStore interface {
 	// AddDownload records a torrent handed to Transmission so the completion
 	// watcher can notify when it finishes.
 	AddDownload(ctx context.Context, hash, title, source string) error
+	// CancelDownload closes out a download the user rejected, keeping it out of
+	// both the active list and the completed history.
+	CancelDownload(ctx context.Context, hash string) error
 }
 
 var _ SubscriptionStore = (*store.Store)(nil)
@@ -54,9 +57,11 @@ const completedFormat = "2006-01-02 15:04"
 const lastCheckedFormat = "2006-01-02 15:04"
 
 const subUsage = "Usage: /sub <query> | <filters>\n" +
-	"Example: /sub space show 2026 | rus, 1080p, x265, -720p, >1gb"
+	"Example: /sub space show 2026 | rus, 1080p, x265, -720p, >1gb\n" +
+	"Add the backlog filter to also grab what is already on the tracker."
 
 const helpText = `🔍 Send any text to search for torrents; tap a result to download it.
+Tap 🔔 under the results to subscribe to that exact search.
 Tap ℹ️<number> to see that release in full first — every detail line
 untruncated, what the tracker says about it, and the list of files inside.
 A result the bot already grabbed is marked: ⬇️ downloading · ✅ downloaded.
@@ -74,7 +79,12 @@ Filters (comma-separated, case-insensitive, all optional):
   rus — required substring
   -720p — excluded substring
   /x26[45]/ — required regex, -/cam|ts/ — excluded regex
-  >1gb / <30gb — size bounds (mb or gb)`
+  >1gb / <30gb — size bounds (mb or gb)
+  backlog — also grab what is already on the tracker
+
+A subscription downloads new releases by itself and says so in the chat, with
+a 🗑 button to delete one you did not want. By default it only takes releases
+published after you created it; tap ⬇️ for anything already listed.`
 
 // commandMenu is the command list registered with Telegram so the client
 // offers a menu button; Telegram wants commands without the leading slash.
@@ -138,18 +148,27 @@ func (h *Handlers) cmdSub(ctx context.Context, api telegramAPI, chatID int64, ar
 		h.reply(ctx, api, chatID, subUsage)
 		return
 	}
+	// backlog is a property of the subscription rather than of the title, so it
+	// has to come out before Parse — left in, it would become a required
+	// substring and the subscription would match nothing at all.
+	filterPart, wantBacklog := cutBacklogToken(filterPart)
 	f, err := filter.Parse(filterPart)
 	if err != nil {
 		h.reply(ctx, api, chatID, fmt.Sprintf("Bad filter: %v\n\n%s", err, subUsage))
 		return
 	}
 
+	cutoff := time.Now().UTC()
+	if wantBacklog {
+		cutoff = time.Time{}
+	}
 	sub, err := h.subs.CreateSubscription(ctx, store.Subscription{
 		Query:     query,
 		Include:   f.Include,
 		Exclude:   f.Exclude,
 		MinSizeMB: f.MinSizeMB,
 		MaxSizeMB: f.MaxSizeMB,
+		CutoffAt:  cutoff,
 	})
 	if err != nil {
 		h.reply(ctx, api, chatID, fmt.Sprintf("Failed to save subscription: %v", err))
@@ -160,8 +179,41 @@ func (h *Handlers) cmdSub(ctx context.Context, api telegramAPI, chatID int64, ar
 	if fs := f.String(); fs != "" {
 		msg += "\nFilters: " + fs
 	}
+	msg += "\n" + cutoffLine(sub)
 	h.reply(ctx, api, chatID, msg)
 }
+
+// backlogToken opts a subscription out of the publish-date cutoff, so it grabs
+// what is already on the tracker as well as what turns up later.
+const backlogToken = "backlog"
+
+// cutBacklogToken removes the backlog token from a filter string, reporting
+// whether it was there. Matching is case-insensitive and per token, so a
+// release title containing the word is untouched.
+func cutBacklogToken(filters string) (rest string, found bool) {
+	kept := make([]string, 0, strings.Count(filters, ",")+1)
+	for _, tok := range strings.Split(filters, ",") {
+		if strings.EqualFold(strings.TrimSpace(tok), backlogToken) {
+			found = true
+			continue
+		}
+		kept = append(kept, tok)
+	}
+	return strings.Join(kept, ","), found
+}
+
+// cutoffLine states what a subscription will and will not reach back for. It
+// is the one visible sign of the publish-date cutoff, so it is spelled out on
+// creation and repeated in /subs rather than left to be discovered.
+func cutoffLine(sub store.Subscription) string {
+	if sub.CutoffAt.IsZero() {
+		return "Grabbing everything that matches, including older releases."
+	}
+	return "Grabbing releases published from " + sub.CutoffAt.UTC().Format(cutoffFormat) + " onward."
+}
+
+// cutoffFormat renders the cutoff date; the day is the useful precision here.
+const cutoffFormat = "2006-01-02"
 
 // cmdSubs lists every subscription with filters, state, and stats.
 func (h *Handlers) cmdSubs(ctx context.Context, api telegramAPI, chatID int64) {
@@ -198,6 +250,11 @@ func subscriptionLine(sub store.Subscription) string {
 		lastCheck = sub.LastCheckedAt.UTC().Format(lastCheckedFormat)
 	}
 	fmt.Fprintf(&b, "\n    grabs: %d · last check: %s", sub.Grabs, lastCheck)
+	if sub.CutoffAt.IsZero() {
+		b.WriteString("\n    from: any date (backlog included)")
+	} else {
+		b.WriteString("\n    from: " + sub.CutoffAt.UTC().Format(cutoffFormat))
+	}
 	return b.String()
 }
 
@@ -277,7 +334,7 @@ func (h *Handlers) cmdTest(ctx context.Context, api telegramAPI, chatID int64, a
 	f := subFilter(sub)
 	var matched []prowlarr.Release
 	for _, r := range releases {
-		if f.Match(r.Title, r.Size) {
+		if f.Match(r.Title, r.Size, r.PublishDate) {
 			matched = append(matched, r)
 		}
 	}
@@ -376,13 +433,17 @@ func completedSection(completed []store.Download) string {
 	return b.String()
 }
 
-// subFilter rebuilds the release filter a subscription was created with.
+// subFilter rebuilds the release filter a subscription was created with. The
+// cutoff rides along so that /test judges a release exactly as the engine
+// would; a dry run that reported matches the engine then skipped would be
+// worse than no dry run at all.
 func subFilter(sub store.Subscription) filter.Filter {
 	return filter.Filter{
 		Include:   sub.Include,
 		Exclude:   sub.Exclude,
 		MinSizeMB: sub.MinSizeMB,
 		MaxSizeMB: sub.MaxSizeMB,
+		Since:     sub.CutoffAt,
 	}
 }
 

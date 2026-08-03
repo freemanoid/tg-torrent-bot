@@ -295,8 +295,10 @@ func (h *Handlers) offerReject(ctx context.Context, api telegramAPI, cb *models.
 }
 
 // keepRejected abandons the confirmation, restoring the plain reject button.
+// The fallback matters even though nothing changed: a tap that produces no
+// visible answer at all reads as a broken bot.
 func (h *Handlers) keepRejected(ctx context.Context, api telegramAPI, cb *models.CallbackQuery, chatID int64, hash string) {
-	h.swapKeyboard(ctx, api, cb, chatID, rejectKeyboard(hash), "")
+	h.swapKeyboard(ctx, api, cb, chatID, rejectKeyboard(hash), "↩️ Kept — the download continues.")
 }
 
 // swapKeyboard replaces the keyboard on the message a callback came from,
@@ -346,12 +348,19 @@ func (h *Handlers) reject(ctx context.Context, api telegramAPI, cb *models.Callb
 	}
 
 	// Transmission no longer has it, so the row must not stay active or the
-	// watcher would keep polling for something that will never finish.
+	// watcher would keep polling for something that will never finish. If this
+	// write fails the torrent is still gone but the row stays active, and the
+	// watcher will close it out as *completed* — so the failure is reported
+	// rather than only logged, or the chat would later claim the bot finished
+	// downloading something the user had just thrown away.
+	msg := "🗑 Removed, and the downloaded files are deleted."
 	if err := h.subs.CancelDownload(ctx, hash); err != nil && !errors.Is(err, store.ErrNotFound) {
 		h.log.Error("cancel download", "hash", hash, "error", err)
+		msg += fmt.Sprintf("\n\n⚠️ The bot could not update its own records (%v),"+
+			" so this may still show up as finished in /status.", err)
 	}
 	h.swapKeyboard(ctx, api, cb, chatID, clearedKeyboard(), "")
-	h.reply(ctx, api, chatID, "🗑 Removed, and the downloaded files are deleted.")
+	h.reply(ctx, api, chatID, msg)
 }
 
 // clearedKeyboard is an explicitly empty keyboard, used once a notification

@@ -1453,3 +1453,59 @@ func TestCancelledDownloadsAreUnmarkedInResults(t *testing.T) {
 		t.Errorf("statusMark(cancelled) = %q, want no marker", got)
 	}
 }
+
+// The torrent is gone either way; what matters is that the chat is not left
+// believing the download will finish normally.
+func TestRejectWarnsWhenTheStoreCannotBeUpdated(t *testing.T) {
+	tr := &fakeTrans{}
+	h, subs := newTestHandlers(&fakeSearcher{}, tr)
+	subs.cancelErr = errors.New("database is locked")
+	tg := &fakeTG{}
+	cb := callbackUpdateFrom(testChatID, encodeCallback(cbRejectOK, "abc123", 0))
+	cb.CallbackQuery.Message.Message.Text = "📥 grabbed:\nSpace Show S01E11"
+
+	h.HandleCallback(context.Background(), tg, cb)
+
+	if len(tr.removed) != 1 {
+		t.Fatalf("removed = %v, want the torrent gone regardless of the store failure", tr.removed)
+	}
+	text := tg.lastSentText(t)
+	if !strings.Contains(text, "database is locked") {
+		t.Errorf("reply %q must surface the store failure", text)
+	}
+	if !strings.Contains(text, "/status") {
+		t.Errorf("reply %q must warn that the download may still show as finished", text)
+	}
+}
+
+// A download that was never recorded is nothing to warn about: the removal
+// still did exactly what was asked.
+func TestRejectStaysQuietWhenTheRowIsAlreadyGone(t *testing.T) {
+	tr := &fakeTrans{}
+	h, subs := newTestHandlers(&fakeSearcher{}, tr)
+	subs.cancelErr = fmt.Errorf("download abc123: %w", store.ErrNotFound)
+	tg := &fakeTG{}
+	cb := callbackUpdateFrom(testChatID, encodeCallback(cbRejectOK, "abc123", 0))
+	cb.CallbackQuery.Message.Message.Text = "📥 grabbed:\nSpace Show S01E11"
+
+	h.HandleCallback(context.Background(), tg, cb)
+
+	if text := tg.lastSentText(t); strings.Contains(text, "⚠️") {
+		t.Errorf("reply %q must not warn when there was simply no row to close", text)
+	}
+}
+
+// An inaccessible message means the keyboard cannot be restored, but the tap
+// still has to produce an answer.
+func TestKeepAnswersEvenWithoutTheOriginalMessage(t *testing.T) {
+	h, _ := newTestHandlers(&fakeSearcher{}, &fakeTrans{})
+	tg := &fakeTG{}
+	cb := callbackUpdateFrom(testChatID, encodeCallback(cbRejectNo, "abc123", 0))
+	cb.CallbackQuery.Message.Message = nil
+
+	h.HandleCallback(context.Background(), tg, cb)
+
+	if text := tg.lastSentText(t); !strings.Contains(text, "Kept") {
+		t.Errorf("reply %q, want confirmation that the download was kept", text)
+	}
+}

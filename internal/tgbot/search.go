@@ -389,7 +389,7 @@ func resultsKeyboard(searchID string, releases []prowlarr.Release, page int, mar
 	page = clampPage(len(releases), page)
 	start, end := pageBounds(len(releases), page)
 
-	rows := make([][]models.InlineKeyboardButton, 0, end-start+2)
+	rows := make([][]models.InlineKeyboardButton, 0, end-start+3)
 	for i := start; i < end; i++ {
 		rows = append(rows, []models.InlineKeyboardButton{{
 			Text:         buttonLabel(i+1, releases[i], marks[i]),
@@ -409,6 +409,25 @@ func resultsKeyboard(searchID string, releases []prowlarr.Release, page int, mar
 	}
 	if len(info) > 0 {
 		rows = append(rows, info)
+	}
+
+	// Tracker pages ride in a row of their own, for the same reason the details
+	// buttons do. They are link buttons rather than callbacks — Telegram opens
+	// the page itself — and cost the message text nothing, which matters
+	// because the results message shares a tight rune budget between five
+	// blocks. A release whose indexer published no usable page simply has no
+	// button; the numbers say which result each link belongs to.
+	links := make([]models.InlineKeyboardButton, 0, end-start)
+	for i := start; i < end; i++ {
+		if u := linkURL(releases[i]); u != "" {
+			links = append(links, models.InlineKeyboardButton{
+				Text: fmt.Sprintf("🔗%d", i+1),
+				URL:  u,
+			})
+		}
+	}
+	if len(links) > 0 {
+		rows = append(rows, links)
 	}
 
 	var nav []models.InlineKeyboardButton

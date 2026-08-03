@@ -292,6 +292,74 @@ func TestHandleTextBuildsKeyboard(t *testing.T) {
 	}
 }
 
+// --- tracker links ---
+
+func TestResultsKeyboardLinksToTrackerPages(t *testing.T) {
+	releases := nReleases(2*perPage + 1)
+	releases[0].InfoURL = "https://tracker-a.example.com/forum/viewtopic.php?t=111"
+	releases[2].InfoURL = "viewtopic.php?t=333" // indexer text that is no usable link
+	releases[3].InfoURL = "https://tracker-b.example.com/t/222"
+	releases[perPage].InfoURL = "https://tracker-a.example.com/t/999" // second page
+
+	kb := resultsKeyboard("a1b2c3d4", releases, 0, nil)
+
+	if len(kb.InlineKeyboard) != perPage+3 { // results + details + links + nav
+		t.Fatalf("keyboard has %d rows, want %d", len(kb.InlineKeyboard), perPage+3)
+	}
+
+	links := kb.InlineKeyboard[perPage+1]
+	if len(links) != 2 {
+		t.Fatalf("link row has %d buttons, want 2 (only the linkable results)", len(links))
+	}
+	for i, want := range []struct{ label, url string }{
+		{"1", releases[0].InfoURL},
+		{"4", releases[3].InfoURL},
+	} {
+		if !strings.Contains(links[i].Text, want.label) {
+			t.Errorf("link button %d labelled %q, want the result number %s in it", i, links[i].Text, want.label)
+		}
+		if links[i].URL != want.url {
+			t.Errorf("link button %d URL = %q, want %q", i, links[i].URL, want.url)
+		}
+		// A link button opens the page; it must never also fire a callback.
+		if links[i].CallbackData != "" {
+			t.Errorf("link button %d carries callback data %q, want none", i, links[i].CallbackData)
+		}
+	}
+
+	// The pager stays last, so the keyboard reads results → details → links → nav.
+	nav := kb.InlineKeyboard[len(kb.InlineKeyboard)-1]
+	if kind, _, _, err := decodeCallback(nav[0].CallbackData); err != nil || kind != cbPage {
+		t.Errorf("last row = (%q, %v), want the pager", kind, err)
+	}
+
+	// Each page links its own releases, not the ones before it.
+	second := resultsKeyboard("a1b2c3d4", releases, 1, nil)
+	links = second.InlineKeyboard[perPage+1]
+	if len(links) != 1 || links[0].URL != releases[perPage].InfoURL {
+		t.Errorf("page 2 link row = %v, want only result %d's tracker page", links, perPage+1)
+	}
+}
+
+func TestResultsKeyboardOmitsLinkRowWithoutTrackerPages(t *testing.T) {
+	// Most indexers publish no infoUrl at all; an empty row would be a dead
+	// strip of keyboard on a phone.
+	releases := nReleases(3)
+
+	kb := resultsKeyboard("a1b2c3d4", releases, 0, nil)
+
+	if len(kb.InlineKeyboard) != len(releases)+1 { // results + details row only
+		t.Fatalf("keyboard has %d rows, want %d", len(kb.InlineKeyboard), len(releases)+1)
+	}
+	for _, row := range kb.InlineKeyboard {
+		for _, btn := range row {
+			if btn.URL != "" {
+				t.Errorf("button %q carries URL %q, want none", btn.Text, btn.URL)
+			}
+		}
+	}
+}
+
 // --- download-state markers ---
 
 func TestSearchMarksAlreadyGrabbedReleases(t *testing.T) {

@@ -2,6 +2,7 @@ package tgbot
 
 import (
 	"fmt"
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -200,6 +201,35 @@ func cautionMark(info mediainfo.Info) string {
 		return "⚠️"
 	}
 	return ""
+}
+
+// maxLinkURLBytes caps a link button's URL. Telegram states no limit, but a
+// URL it refuses fails the whole send — and the send is a search that may have
+// taken minutes. An indexer publishing kilobytes of "URL" gets no button.
+const maxLinkURLBytes = 2048
+
+// linkURL is the release's page on the tracker, when it can be published as a
+// link button, and empty otherwise — hence the "when possible" in what the
+// keyboard offers.
+//
+// The value is indexer-supplied and reaches Telegram unescaped, so it is
+// checked rather than trusted: Telegram answers BUTTON_URL_INVALID for
+// anything that is not an absolute http(s) URL and rejects the entire message,
+// which would cost the search that produced it. A relative link or a bare
+// hostname — both of which trackers do publish — is therefore no link here.
+func linkURL(r prowlarr.Release) string {
+	raw := strings.TrimSpace(r.InfoURL)
+	if raw == "" || len(raw) > maxLinkURLBytes {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return ""
+	}
+	return raw
 }
 
 // joinNonEmpty joins the parts that are not empty, so an unknown field leaves

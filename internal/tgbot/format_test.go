@@ -371,6 +371,36 @@ func TestResultsHeader(t *testing.T) {
 	}
 }
 
+// --- tracker links ---
+
+func TestLinkURL(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"tracker page", "https://tracker-a.example.com/forum/viewtopic.php?t=111", "https://tracker-a.example.com/forum/viewtopic.php?t=111"},
+		{"plain http", "http://tracker-b.example.com/t/222", "http://tracker-b.example.com/t/222"},
+		{"padded", "  https://tracker-a.example.com/t/1\n", "https://tracker-a.example.com/t/1"},
+		{"none published", "", ""},
+		{"blank", "   ", ""},
+		{"no scheme", "tracker-a.example.com/t/1", ""},
+		{"relative", "/forum/viewtopic.php?t=111", ""},
+		{"magnet", "magnet:?xt=urn:btih:0123456789abcdef", ""},
+		{"script", "javascript:alert(1)", ""},
+		{"no host", "http:///forum/t/1", ""},
+		{"unparseable", "http://tracker-a.example.com/\x7f\x00", ""},
+		{"absurdly long", "https://tracker-a.example.com/" + strings.Repeat("x", maxLinkURLBytes), ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := linkURL(prowlarr.Release{InfoURL: tt.in}); got != tt.want {
+				t.Errorf("linkURL(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
 // --- details view ---
 
 func detailsRelease() prowlarr.Release {

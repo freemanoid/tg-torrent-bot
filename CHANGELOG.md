@@ -5,6 +5,12 @@ the binary: after an update the bot posts the entry matching the version it is
 running, so keep entries short, plain, and headed `## v<version>` — the same
 version the git tag carries.
 
+## v1.7.0
+
+- Search results now carry 🔗 buttons: tap one to open that release's page on
+  the tracker — screenshots, notes, comments, everything the search itself
+  cannot show. Only results whose indexer published a page get a button.
+
 ## v1.6.0
 
 - New ℹ️ buttons under the search results: tap one to see that release in full

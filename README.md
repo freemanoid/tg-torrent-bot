@@ -232,6 +232,12 @@ and the file list is read out of the .torrent itself. A magnet-only release has
 no .torrent to read, so it says the file list is unavailable and still offers
 the download — the magnet works regardless.
 
+Below that row sits **🔗1 … 🔗5**: one button per result whose indexer published
+a page for it, opening that page in the browser for everything the API never
+carries — screenshots, the uploader's notes, the comments. Only results with a
+usable link get a button, so the row is often short and is left out entirely
+when no result on the page has one.
+
 ## Filter syntax (`/sub`, after the `|`)
 
 Comma-separated tokens, matched case-insensitively (Cyrillic included)

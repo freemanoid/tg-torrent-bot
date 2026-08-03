@@ -10,7 +10,9 @@ version the git tag carries.
 - The settings page now takes a list of allowed chat IDs, not just one, so the
   bot can be shared — with a partner, a family group, a second device. Each
   search is answered in the chat that asked for it; subscription grabs and
-  "finished" notices go to everyone on the list.
+  "finished" notices go to everyone on the list. Subscriptions and downloads
+  belong to the bot rather than to one chat, so anyone allowed can list, pause
+  or remove any of them.
 - The settings page shows the bot token, Prowlarr API key and Transmission
   password in full instead of blank boxes, so they can be read and copied
   straight from the form. Because every value is now visible, saving stores

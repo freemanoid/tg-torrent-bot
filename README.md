@@ -26,7 +26,8 @@ silent container restart no longer hides what arrived.
 Only the chat IDs on the allowlist can talk to the bot; every other update is
 dropped silently. List several to share one bot with a household — each search
 is answered in the chat that asked, while subscription and completion notices
-go to everyone.
+go to everyone. Subscriptions and downloads belong to the bot, not to a chat:
+anyone allowed can list, pause or remove any of them.
 
 ## Architecture
 

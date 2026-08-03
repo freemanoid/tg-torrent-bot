@@ -171,15 +171,24 @@ func TestBotNotifyFansOutToEveryAllowedChat(t *testing.T) {
 func TestBotNotifyPartialFailureStillDelivers(t *testing.T) {
 	// One unreachable chat — bot blocked, group deleted — must not silence the
 	// others, and must not be reported as a failed notification.
-	var n int
+	// The failure is keyed on the chat, not on call order, so the test keeps
+	// meaning if the sends are ever reordered.
 	var mu sync.Mutex
+	var tried []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		n++
-		first := n == 1
-		mu.Unlock()
+		chat := ""
+		if err := r.ParseMultipartForm(1 << 20); err == nil {
+			if vs := r.MultipartForm.Value["chat_id"]; len(vs) > 0 {
+				chat = vs[0]
+			}
+		}
+		if strings.HasSuffix(r.URL.Path, "/sendMessage") {
+			mu.Lock()
+			tried = append(tried, chat)
+			mu.Unlock()
+		}
 		w.Header().Set("Content-Type", "application/json")
-		if first && strings.HasSuffix(r.URL.Path, "/sendMessage") {
+		if chat == "42" {
 			w.Write([]byte(`{"ok":false,"error_code":403,"description":"Forbidden: bot was blocked by the user"}`))
 			return
 		}
@@ -199,8 +208,9 @@ func TestBotNotifyPartialFailureStillDelivers(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if n != 2 {
-		t.Errorf("sendMessage attempts = %d, want 2 (a failed chat must not stop the rest)", n)
+	slices.Sort(tried)
+	if want := []string{"42", "7"}; !slices.Equal(tried, want) {
+		t.Errorf("chats attempted = %v, want %v (a failed chat must not stop the rest)", tried, want)
 	}
 }
 

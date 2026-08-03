@@ -322,9 +322,9 @@ func (h *Handlers) cmdTest(ctx context.Context, api telegramAPI, chatID int64, a
 		return
 	}
 
-	// Same slow search as a plain query, so the same ack — but left standing
-	// rather than edited: the dry-run answer below is a list that h.reply may
-	// have to split across several messages.
+	// Same slow search as a plain query, so the same ack, and the same standing
+	// ack with the answer sent underneath it — doubly so here, where the answer
+	// is a list h.reply may have to split across several messages.
 	h.ackSearching(ctx, api, chatID, sub.Query)
 
 	releases, err := h.searcher.Search(ctx, sub.Query)

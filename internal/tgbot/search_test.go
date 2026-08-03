@@ -71,14 +71,22 @@ func (f *fakeTG) AnswerCallbackQuery(_ context.Context, p *bot.AnswerCallbackQue
 	return true, nil
 }
 
-func (f *fakeTG) lastSentText(t *testing.T) string {
+// lastSent is the newest message in the chat. For a search that is the answer:
+// the "Searching…" ack is left standing above it rather than edited into it, so
+// the answer is always the later message.
+func (f *fakeTG) lastSent(t *testing.T) *bot.SendMessageParams {
 	t.Helper()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if len(f.sent) == 0 {
 		t.Fatal("no messages sent")
 	}
-	return f.sent[len(f.sent)-1].Text
+	return f.sent[len(f.sent)-1]
+}
+
+func (f *fakeTG) lastSentText(t *testing.T) string {
+	t.Helper()
+	return f.lastSent(t).Text
 }
 
 func (f *fakeTG) lastEditedText(t *testing.T) string {
@@ -267,6 +275,50 @@ func TestHandleTextAcksBeforeSearching(t *testing.T) {
 	}
 }
 
+func TestHandleTextSendsResultsAsANewMessage(t *testing.T) {
+	// Editing the ack raises no Telegram notification, so a search that ran for
+	// minutes would finish silently. The answer is a message of its own, and the
+	// ack stays where it was.
+	s := &fakeSearcher{releases: nReleases(3)}
+	h, _ := newTestHandlers(s, &fakeTrans{})
+	tg := &fakeTG{}
+
+	h.HandleText(context.Background(), tg, textUpdate("space show"))
+
+	if len(tg.edited) != 0 {
+		t.Errorf("edited %d messages, want 0 (the results are sent, not edited in)", len(tg.edited))
+	}
+	if len(tg.sent) != 2 {
+		t.Fatalf("sent %d messages, want 2 (the ack and the results)", len(tg.sent))
+	}
+	if !strings.Contains(tg.sent[0].Text, "Searching") {
+		t.Errorf("first message %q is not the ack", tg.sent[0].Text)
+	}
+	if !strings.Contains(tg.sent[1].Text, "space show") || tg.sent[1].ReplyMarkup == nil {
+		t.Errorf("second message %q must be the results with their keyboard", tg.sent[1].Text)
+	}
+}
+
+func TestHandleTextSendsSearchFailureAsANewMessage(t *testing.T) {
+	// The outcome of a slow search is worth a notification whether it found
+	// something or failed; an edited ack still reads as "running".
+	s := &fakeSearcher{searchErr: errors.New("prowlarr unreachable")}
+	h, _ := newTestHandlers(s, &fakeTrans{})
+	tg := &fakeTG{}
+
+	h.HandleText(context.Background(), tg, textUpdate("space show"))
+
+	if len(tg.edited) != 0 {
+		t.Errorf("edited %d messages, want 0 (the failure is sent, not edited in)", len(tg.edited))
+	}
+	if len(tg.sent) != 2 {
+		t.Fatalf("sent %d messages, want 2 (the ack and the failure)", len(tg.sent))
+	}
+	if !strings.Contains(tg.sent[1].Text, "prowlarr unreachable") {
+		t.Errorf("second message %q does not report the failure", tg.sent[1].Text)
+	}
+}
+
 func TestHandleTextBuildsKeyboard(t *testing.T) {
 	s := &fakeSearcher{releases: nReleases(2*perPage + 5)}
 	h, _ := newTestHandlers(s, &fakeTrans{})
@@ -277,18 +329,9 @@ func TestHandleTextBuildsKeyboard(t *testing.T) {
 	if got := s.queries; len(got) != 1 || got[0] != "space show" {
 		t.Fatalf("searched queries = %v, want [space show]", got)
 	}
-	if len(tg.sent) != 1 {
-		t.Fatalf("sent %d messages, want 1 (the ack)", len(tg.sent))
-	}
-	if len(tg.edited) != 1 {
-		t.Fatalf("edited %d messages, want 1 (the ack turned into results)", len(tg.edited))
-	}
-	msg := tg.edited[0]
+	msg := tg.lastSent(t)
 	if msg.ChatID != testChatID {
 		t.Errorf("ChatID = %v, want %d", msg.ChatID, testChatID)
-	}
-	if msg.MessageID != 1 {
-		t.Errorf("edited message %d, want 1 (the ack message)", msg.MessageID)
 	}
 	if !strings.Contains(msg.Text, "space show") || !strings.Contains(msg.Text, "1/3") {
 		t.Errorf("header %q missing query or page 1/3", msg.Text)
@@ -422,7 +465,7 @@ func TestSearchMarksAlreadyGrabbedReleases(t *testing.T) {
 
 	h.HandleText(context.Background(), tg, textUpdate("space show"))
 
-	msg := tg.edited[0]
+	msg := tg.lastSent(t)
 	if !strings.Contains(msg.Text, "1. "+markActive) {
 		t.Errorf("result 1 should be marked as downloading:\n%s", msg.Text)
 	}
@@ -466,7 +509,7 @@ func TestPageFlipRecomputesMarks(t *testing.T) {
 	tg := &fakeTG{}
 
 	h.HandleText(context.Background(), tg, textUpdate("space show"))
-	_, id, _, err := decodeCallback(keyboardOf(t, tg.edited[0].ReplyMarkup).InlineKeyboard[0][0].CallbackData)
+	_, id, _, err := decodeCallback(keyboardOf(t, tg.lastSent(t).ReplyMarkup).InlineKeyboard[0][0].CallbackData)
 	if err != nil {
 		t.Fatalf("decodeCallback = %v", err)
 	}
@@ -495,10 +538,7 @@ func TestSearchSurvivesMarkLookupFailure(t *testing.T) {
 
 	h.HandleText(context.Background(), tg, textUpdate("space show"))
 
-	if len(tg.edited) != 1 {
-		t.Fatalf("edited %d messages, want 1 (the results)", len(tg.edited))
-	}
-	msg := tg.edited[0]
+	msg := tg.lastSent(t)
 	if !strings.Contains(msg.Text, "1. Release 0") {
 		t.Errorf("results should render unmarked:\n%s", msg.Text)
 	}
@@ -517,7 +557,7 @@ func TestHandleTextSearchErrorSurfacesIndexer(t *testing.T) {
 
 	h.HandleText(context.Background(), tg, textUpdate("dune"))
 
-	if got := tg.lastEditedText(t); !strings.Contains(got, "TrackerA") {
+	if got := tg.lastSentText(t); !strings.Contains(got, "TrackerA") {
 		t.Errorf("reply %q does not surface the failing indexer", got)
 	}
 }
@@ -528,7 +568,7 @@ func TestHandleTextNoResults(t *testing.T) {
 
 	h.HandleText(context.Background(), tg, textUpdate("nothing here"))
 
-	got := tg.lastEditedText(t)
+	got := tg.lastSentText(t)
 	if !strings.Contains(got, "No results") || !strings.Contains(got, "nothing here") {
 		t.Errorf("reply %q should say there are no results for the query", got)
 	}
@@ -551,7 +591,7 @@ func TestHandleTextExcludesMatchingReleases(t *testing.T) {
 	if got := s.queries; len(got) != 1 || got[0] != "формула 1 2026 2160p 10 rus" {
 		t.Fatalf("searched queries = %q, want the exclusion stripped", got)
 	}
-	msg := tg.lastEditedText(t)
+	msg := tg.lastSentText(t)
 	if strings.Contains(msg, "AV1,") {
 		t.Errorf("results %q still contain the excluded release", msg)
 	}
@@ -576,7 +616,7 @@ func TestHandleTextEverythingExcluded(t *testing.T) {
 
 	// "No results" alone would be a lie: the search worked, the exclusion did
 	// the removing, and the user has to be able to tell those two apart.
-	got := tg.lastEditedText(t)
+	got := tg.lastSentText(t)
 	if !strings.Contains(got, "1") || !strings.Contains(got, "excluded") || !strings.Contains(got, "-AV1") {
 		t.Errorf("reply %q must say how many results the exclusions removed", got)
 	}
@@ -617,7 +657,7 @@ func TestSubscribeButtonKeepsTheExclusions(t *testing.T) {
 	tg := &fakeTG{}
 
 	h.HandleText(context.Background(), tg, textUpdate("формула 1 2026 -AV1"))
-	id := searchIDFrom(t, tg.edited[0].ReplyMarkup)
+	id := searchIDFrom(t, tg.lastSent(t).ReplyMarkup)
 	h.HandleCallback(context.Background(), tg, callbackUpdateFrom(testChatID, encodeCallback(cbSub, id, 0)))
 
 	if len(subs.created) != 1 {
@@ -668,37 +708,40 @@ func TestHandleTextAckSendFailureStillDelivers(t *testing.T) {
 	if len(s.queries) != 1 {
 		t.Fatalf("searched %d times, want 1 despite the failed ack", len(s.queries))
 	}
-	if len(tg.edited) != 0 {
-		t.Errorf("edited %d messages, want 0 (there is no ack to edit)", len(tg.edited))
-	}
 	if len(tg.sent) != 1 {
-		t.Fatalf("delivered %d messages, want 1 fresh results message", len(tg.sent))
+		t.Fatalf("delivered %d messages, want 1 results message", len(tg.sent))
 	}
 	msg := tg.sent[0]
 	if !strings.Contains(msg.Text, "1/3") {
 		t.Errorf("results header %q missing page 1/3", msg.Text)
 	}
 	if keyboardOf(t, msg.ReplyMarkup) == nil {
-		t.Error("fresh results message has no keyboard")
+		t.Error("results message has no keyboard")
 	}
 }
 
-func TestHandleTextAckEditFailureFallsBackToFreshMessage(t *testing.T) {
-	s := &fakeSearcher{releases: nReleases(2*perPage + 5)}
-	h, _ := newTestHandlers(s, &fakeTrans{})
+func TestDetailsAckEditFailureFallsBackToFreshMessage(t *testing.T) {
+	// The details view still turns its own ack into the answer — it replies to a
+	// tap the user is watching for. When that edit fails the answer must still
+	// arrive as a message of its own.
+	releases := nReleases(1)
+	releases[0].DownloadURL = "" // magnet-only: no .torrent to fetch
+	releases[0].MagnetURL = "magnet:?xt=urn:btih:aa"
+	h, _ := newTestHandlers(&fakeSearcher{releases: releases}, &fakeTrans{})
 	tg := &fakeTG{editErr: errors.New("message to edit not found")}
+	id := h.cache.Put(cachedSearch{Query: searchFor("q"), Releases: releases})
 
-	h.HandleText(context.Background(), tg, textUpdate("space show"))
+	h.HandleCallback(context.Background(), tg, callbackUpdate(encodeCallback(cbInfo, id, 0)))
 
 	if len(tg.sent) != 2 {
-		t.Fatalf("sent %d messages, want 2 (ack + fresh results after the edit failed)", len(tg.sent))
+		t.Fatalf("sent %d messages, want 2 (ack + fresh details after the edit failed)", len(tg.sent))
 	}
 	msg := tg.sent[1]
-	if !strings.Contains(msg.Text, "1/3") {
-		t.Errorf("results header %q missing page 1/3", msg.Text)
+	if !strings.Contains(msg.Text, releases[0].Title) {
+		t.Errorf("details %q lost the release title", msg.Text)
 	}
 	if keyboardOf(t, msg.ReplyMarkup) == nil {
-		t.Error("fresh results message has no keyboard")
+		t.Error("fresh details message has no keyboard")
 	}
 }
 

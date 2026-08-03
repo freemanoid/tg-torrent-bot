@@ -359,6 +359,14 @@ TTL.
   accordingly. `detailsMessage` budgets the same way and reserves room for the
   "… and N more file(s)" line *before* cutting the list — a file list clipped
   without that line claims to be the whole torrent.
+- **A search answers with a new message; the "🔎 Searching…" ack stays put.**
+  Editing a message raises no Telegram notification, so folding the answer into
+  the ack would let a search that ran for minutes finish silently — the whole
+  point of the ack is a user who put the phone down. `send` is that path, for
+  the results and for every "no results"/"search failed" outcome alike.
+  `answer` — edit the ack, fall back to a fresh message — is now the details
+  view's alone, where the reply lands on a tap the user is already watching.
+  Page flips and keyboard swaps keep editing: they change a message in place.
 - **On Umbrel, reach services by container name** (`prowlarr_server_1:9696`,
   `transmission_server_1:9091`). `umbrel.local` is mDNS and does not resolve
   inside containers, and published ports sit behind an auth proxy that answers

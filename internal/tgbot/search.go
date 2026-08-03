@@ -89,15 +89,15 @@ func (h *Handlers) HandleText(ctx context.Context, api telegramAPI, update *mode
 		return
 	}
 
-	ack := h.ackSearching(ctx, api, chatID, q.Raw)
+	h.ackSearching(ctx, api, chatID, q.Raw)
 
 	releases, err := h.searcher.Search(ctx, q.Terms)
 	if err != nil {
-		h.answer(ctx, api, chatID, ack, "Search failed: "+err.Error(), nil)
+		h.send(ctx, api, chatID, "Search failed: "+err.Error(), nil)
 		return
 	}
 	if len(releases) == 0 {
-		h.answer(ctx, api, chatID, ack, fmt.Sprintf("No results for «%s».", q.Raw), nil)
+		h.send(ctx, api, chatID, fmt.Sprintf("No results for «%s».", q.Raw), nil)
 		return
 	}
 	// Excluding happens before the results are cached, so the page numbering,
@@ -106,7 +106,7 @@ func (h *Handlers) HandleText(ctx context.Context, api telegramAPI, update *mode
 	found := len(releases)
 	releases = q.keep(releases)
 	if len(releases) == 0 {
-		h.answer(ctx, api, chatID, ack, fmt.Sprintf(
+		h.send(ctx, api, chatID, fmt.Sprintf(
 			"No results for «%s» — all %d match(es) were excluded by %s.",
 			q.Raw, found, q.excludeList()), nil)
 		return
@@ -114,7 +114,7 @@ func (h *Handlers) HandleText(ctx context.Context, api telegramAPI, update *mode
 
 	id := h.cache.Put(cachedSearch{Query: q, Releases: releases})
 	marks := h.pageMarks(ctx, releases, 0)
-	h.answer(ctx, api, chatID, ack,
+	h.send(ctx, api, chatID,
 		resultsMessage(q.Raw, releases, 0, marks),
 		resultsKeyboard(id, releases, 0, marks))
 }
@@ -185,8 +185,13 @@ func (h *Handlers) pageMarks(ctx context.Context, releases []prowlarr.Release, p
 // the query was picked up: a search regularly runs for minutes (a cold
 // FlareSolverr Cloudflare challenge alone measured ~193 s) and a silent bot
 // looks stuck.
-func (h *Handlers) ackSearching(ctx context.Context, api telegramAPI, chatID int64, query string) int {
-	return h.ack(ctx, api, chatID, fmt.Sprintf("🔎 Searching «%s»…", query))
+//
+// It is left standing rather than edited into the answer. Editing a message
+// raises no Telegram notification, so a user who put the phone down would
+// never learn the search had finished — and by the time it does, the ack is
+// far enough up the chat that replacing it in place is easy to miss anyway.
+func (h *Handlers) ackSearching(ctx context.Context, api telegramAPI, chatID int64, query string) {
+	h.ack(ctx, api, chatID, fmt.Sprintf("🔎 Searching «%s»…", query))
 }
 
 // ack posts a placeholder message and returns the ID to edit the real answer
@@ -202,11 +207,10 @@ func (h *Handlers) ack(ctx context.Context, api telegramAPI, chatID int64, text 
 }
 
 // answer turns an ack message into the final answer, falling back to a fresh
-// message when there is no ack or the edit fails. An answer that carries a
-// keyboard must stay one message — the keyboard is attached to it — so it is
-// never chunked; resultsMessage and detailsMessage are what keep those inside
-// Telegram's limit. The nil-keyboard path still routes through h.reply for the
-// odd long error.
+// message when there is no ack or the edit fails. It belongs to the details
+// view, which answers a button tap the user is watching for: there the edit
+// keeps the chat tidy, and no notification is missed. A search, whose answer
+// can arrive minutes later, sends instead — see ackSearching.
 func (h *Handlers) answer(ctx context.Context, api telegramAPI, chatID int64, ack int, text string, kb models.ReplyMarkup) {
 	if ack != 0 {
 		_, err := api.EditMessageText(ctx, &bot.EditMessageTextParams{
@@ -220,6 +224,15 @@ func (h *Handlers) answer(ctx context.Context, api telegramAPI, chatID int64, ac
 		}
 		h.log.Warn("edit ack", "error", err)
 	}
+	h.send(ctx, api, chatID, text, kb)
+}
+
+// send posts a message as its own chat entry. A message that carries a
+// keyboard must stay one message — the keyboard is attached to it — so it is
+// never chunked; resultsMessage and detailsMessage are what keep those inside
+// Telegram's limit. The nil-keyboard path routes through h.reply so a long
+// error still splits rather than failing to send.
+func (h *Handlers) send(ctx context.Context, api telegramAPI, chatID int64, text string, kb models.ReplyMarkup) {
 	if kb == nil {
 		h.reply(ctx, api, chatID, text)
 		return

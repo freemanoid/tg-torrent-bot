@@ -5,6 +5,14 @@ the binary: after an update the bot posts the entry matching the version it is
 running, so keep entries short, plain, and headed `## v<version>` — the same
 version the git tag carries.
 
+## v1.11.0
+
+- Search results now arrive as a new message instead of replacing the
+  "🔎 Searching…" one. A search can run for minutes, and an edited message
+  raises no Telegram notification — so you had to keep checking the chat to
+  see whether it had finished. Now your phone tells you. The same goes for
+  "no results" and for a search that failed.
+
 ## v1.10.0
 
 - A search word starting with `-` now excludes: send

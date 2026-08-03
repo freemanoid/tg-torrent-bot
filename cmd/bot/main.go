@@ -92,8 +92,8 @@ func newApp(cfg *config.Config, o appOpts) (*app, error) {
 		return nil, err
 	}
 
-	handlers := tgbot.NewHandlers(cfg.AllowedChatID, pr, tr, st, o.log)
-	tb, err := tgbot.New(cfg.TelegramToken, cfg.AllowedChatID, handlers, o.botOpts...)
+	handlers := tgbot.NewHandlers(pr, tr, st, o.log)
+	tb, err := tgbot.New(cfg.TelegramToken, cfg.AllowedChatIDs, handlers, o.botOpts...)
 	if err != nil {
 		st.Close()
 		return nil, err

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -42,8 +43,8 @@ func TestLoadAllVars(t *testing.T) {
 	if cfg.TelegramToken != "123456:test-token" {
 		t.Errorf("TelegramToken = %q", cfg.TelegramToken)
 	}
-	if cfg.AllowedChatID != 42 {
-		t.Errorf("AllowedChatID = %d, want 42", cfg.AllowedChatID)
+	if want := []int64{42}; !slices.Equal(cfg.AllowedChatIDs, want) {
+		t.Errorf("AllowedChatIDs = %v, want %v", cfg.AllowedChatIDs, want)
 	}
 	if cfg.ProwlarrURL != "http://umbrel.local:9696" {
 		t.Errorf("ProwlarrURL = %q", cfg.ProwlarrURL)
@@ -138,8 +139,8 @@ func TestLoadNegativeChatID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() returned error: %v", err)
 	}
-	if cfg.AllowedChatID != -1001234567890 {
-		t.Errorf("AllowedChatID = %d, want -1001234567890", cfg.AllowedChatID)
+	if want := []int64{-1001234567890}; !slices.Equal(cfg.AllowedChatIDs, want) {
+		t.Errorf("AllowedChatIDs = %v, want %v", cfg.AllowedChatIDs, want)
 	}
 }
 
@@ -229,8 +230,8 @@ func TestLoadFromFileOverridesEnv(t *testing.T) {
 	if cfg.TelegramToken != "654321:file-token" {
 		t.Errorf("TelegramToken = %q, want file value", cfg.TelegramToken)
 	}
-	if cfg.AllowedChatID != 99 {
-		t.Errorf("AllowedChatID = %d, want 99", cfg.AllowedChatID)
+	if want := []int64{99}; !slices.Equal(cfg.AllowedChatIDs, want) {
+		t.Errorf("AllowedChatIDs = %v, want %v", cfg.AllowedChatIDs, want)
 	}
 	if cfg.ProwlarrURL != "http://prowlarr.local:9696" {
 		t.Errorf("ProwlarrURL = %q, want file value", cfg.ProwlarrURL)
@@ -318,8 +319,8 @@ func TestLoadFromFileZeroChatID(t *testing.T) {
 	if !errors.As(err, &inc) {
 		t.Fatalf("LoadFrom() error = %v, want *ErrIncomplete", err)
 	}
-	if !slices.Contains(inc.Missing, "allowed_chat_id") {
-		t.Errorf("Missing = %v, want to contain allowed_chat_id", inc.Missing)
+	if !slices.Contains(inc.Missing, "allowed_chat_ids") {
+		t.Errorf("Missing = %v, want to contain allowed_chat_ids", inc.Missing)
 	}
 }
 
@@ -447,7 +448,7 @@ func TestSaveRoundTrip(t *testing.T) {
 
 	saved := &Config{
 		TelegramToken:    "654321:file-token",
-		AllowedChatID:    99,
+		AllowedChatIDs:   []int64{99, -1001234567890},
 		ProwlarrURL:      "http://prowlarr.local:9696",
 		ProwlarrAPIKey:   "file-prowlarr-key",
 		TransmissionURL:  "http://transmission.local:9091",
@@ -483,6 +484,9 @@ func TestSaveRoundTrip(t *testing.T) {
 	if _, ok := keys["db_path"]; ok {
 		t.Error("saved file contains db_path key, want it omitted")
 	}
+	if _, ok := keys["allowed_chat_id"]; ok {
+		t.Error("saved file contains the legacy allowed_chat_id key, want only allowed_chat_ids")
+	}
 
 	got, err := LoadFrom(path)
 	if err != nil {
@@ -490,7 +494,181 @@ func TestSaveRoundTrip(t *testing.T) {
 	}
 	want := *saved
 	want.DBPath = DefaultDBPath // DB_PATH env is blank in this test
-	if *got != want {
+	if !reflect.DeepEqual(*got, want) {
 		t.Errorf("round trip mismatch:\n got %+v\nwant %+v", *got, want)
+	}
+}
+
+// --- chat allowlist ---
+
+func TestLoadMultipleChatIDs(t *testing.T) {
+	setRequired(t)
+	t.Setenv("ALLOWED_CHAT_ID", "42, -1001234567890 ,7")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() returned error: %v", err)
+	}
+	want := []int64{42, -1001234567890, 7}
+	if !slices.Equal(cfg.AllowedChatIDs, want) {
+		t.Errorf("AllowedChatIDs = %v, want %v", cfg.AllowedChatIDs, want)
+	}
+}
+
+func TestParseChatIDs(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want []int64
+	}{
+		{"single", "42", []int64{42}},
+		{"several", "42,7", []int64{42, 7}},
+		{"spaces around entries", " 42 , 7 ", []int64{42, 7}},
+		{"trailing comma", "42,7,", []int64{42, 7}},
+		{"blank entries skipped", "42,,7", []int64{42, 7}},
+		// a chat listed twice would otherwise be notified twice
+		{"repeats dropped", "42,7,42", []int64{42, 7}},
+		{"empty", "", nil},
+		{"only separators", " , ", nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseChatIDs(tt.raw)
+			if err != nil {
+				t.Fatalf("ParseChatIDs(%q) returned error: %v", tt.raw, err)
+			}
+			if !slices.Equal(got, tt.want) {
+				t.Errorf("ParseChatIDs(%q) = %v, want %v", tt.raw, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseChatIDsBad(t *testing.T) {
+	// 0 is the middleware's "update carries no chat" sentinel, never a chat.
+	for _, bad := range []string{"abc", "42,abc", "12.5", "12abc", "42;7", "0", "42,0"} {
+		t.Run(bad, func(t *testing.T) {
+			if _, err := ParseChatIDs(bad); err == nil {
+				t.Errorf("ParseChatIDs(%q) succeeded, want error", bad)
+			}
+		})
+	}
+}
+
+func TestFormatChatIDs(t *testing.T) {
+	if got, want := FormatChatIDs([]int64{42, -7}), "42,-7"; got != want {
+		t.Errorf("FormatChatIDs = %q, want %q", got, want)
+	}
+	if got := FormatChatIDs(nil); got != "" {
+		t.Errorf("FormatChatIDs(nil) = %q, want empty", got)
+	}
+}
+
+func TestValidateRejectsZeroChatID(t *testing.T) {
+	// 0 is the middleware's "update carries no chat" sentinel: an allowlist
+	// containing it would let every chat-less update through.
+	cfg := &Config{
+		TelegramToken:   "t",
+		AllowedChatIDs:  []int64{42, 0},
+		ProwlarrURL:     "http://prowlarr.local:9696",
+		ProwlarrAPIKey:  "k",
+		TransmissionURL: "http://transmission.local:9091",
+		SubInterval:     DefaultSubInterval,
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate() accepted chat ID 0, want error")
+	}
+	var inc *ErrIncomplete
+	if errors.As(err, &inc) {
+		t.Fatalf("Validate() error = %v, want a plain validation error, not ErrIncomplete", err)
+	}
+	if !strings.Contains(err.Error(), "allowed_chat_ids") {
+		t.Errorf("error %q does not mention allowed_chat_ids", err)
+	}
+}
+
+// --- legacy single-chat config file ---
+
+func TestLoadFromLegacyChatIDKey(t *testing.T) {
+	// A config file written before the allowlist became a list must keep its
+	// chat across the upgrade, or every existing install boots into setup mode.
+	clearRequiredEnv(t)
+	path := writeConfigFile(t, `{
+		"telegram_token": "654321:file-token",
+		"allowed_chat_id": 99,
+		"prowlarr_url": "http://prowlarr.local:9696",
+		"prowlarr_api_key": "file-prowlarr-key",
+		"transmission_url": "http://transmission.local:9091"
+	}`)
+
+	cfg, err := LoadFrom(path)
+	if err != nil {
+		t.Fatalf("LoadFrom() returned error: %v", err)
+	}
+	if want := []int64{99}; !slices.Equal(cfg.AllowedChatIDs, want) {
+		t.Errorf("AllowedChatIDs = %v, want %v", cfg.AllowedChatIDs, want)
+	}
+}
+
+func TestLoadFromPluralChatIDsWinsOverLegacy(t *testing.T) {
+	// Both keys present (a file saved by an old version, then edited by hand):
+	// the current key is the one that counts.
+	clearRequiredEnv(t)
+	path := writeConfigFile(t, `{
+		"telegram_token": "654321:file-token",
+		"allowed_chat_id": 99,
+		"allowed_chat_ids": [7, 8],
+		"prowlarr_url": "http://prowlarr.local:9696",
+		"prowlarr_api_key": "file-prowlarr-key",
+		"transmission_url": "http://transmission.local:9091"
+	}`)
+
+	cfg, err := LoadFrom(path)
+	if err != nil {
+		t.Fatalf("LoadFrom() returned error: %v", err)
+	}
+	if want := []int64{7, 8}; !slices.Equal(cfg.AllowedChatIDs, want) {
+		t.Errorf("AllowedChatIDs = %v, want %v", cfg.AllowedChatIDs, want)
+	}
+}
+
+func TestLoadFromFileMultipleChatIDs(t *testing.T) {
+	clearRequiredEnv(t)
+	path := writeConfigFile(t, `{
+		"telegram_token": "654321:file-token",
+		"allowed_chat_ids": [99, -1001234567890],
+		"prowlarr_url": "http://prowlarr.local:9696",
+		"prowlarr_api_key": "file-prowlarr-key",
+		"transmission_url": "http://transmission.local:9091"
+	}`)
+
+	cfg, err := LoadFrom(path)
+	if err != nil {
+		t.Fatalf("LoadFrom() returned error: %v", err)
+	}
+	if want := []int64{99, -1001234567890}; !slices.Equal(cfg.AllowedChatIDs, want) {
+		t.Errorf("AllowedChatIDs = %v, want %v", cfg.AllowedChatIDs, want)
+	}
+}
+
+func TestLoadFromFileEmptyChatIDList(t *testing.T) {
+	// An explicit empty list is as incomplete as no key at all.
+	clearRequiredEnv(t)
+	path := writeConfigFile(t, `{
+		"telegram_token": "654321:file-token",
+		"allowed_chat_ids": [],
+		"prowlarr_url": "http://prowlarr.local:9696",
+		"prowlarr_api_key": "file-prowlarr-key",
+		"transmission_url": "http://transmission.local:9091"
+	}`)
+
+	_, err := LoadFrom(path)
+	var inc *ErrIncomplete
+	if !errors.As(err, &inc) {
+		t.Fatalf("LoadFrom() error = %v, want *ErrIncomplete", err)
+	}
+	if !slices.Contains(inc.Missing, "allowed_chat_ids") {
+		t.Errorf("Missing = %v, want to contain allowed_chat_ids", inc.Missing)
 	}
 }

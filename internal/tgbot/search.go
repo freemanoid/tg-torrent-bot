@@ -40,7 +40,6 @@ type telegramAPI interface {
 // Handlers implements the Telegram update handlers for the interactive search
 // flow: plain text searches, result keyboards, pagination, and downloads.
 type Handlers struct {
-	chatID   int64
 	searcher Searcher
 	trans    transmission.Interface
 	subs     SubscriptionStore
@@ -48,14 +47,15 @@ type Handlers struct {
 	log      *slog.Logger
 }
 
-// NewHandlers wires the search-flow handlers. chatID is the single allowed
-// chat; every reply goes there. A nil log falls back to slog.Default().
-func NewHandlers(chatID int64, searcher Searcher, trans transmission.Interface, subs SubscriptionStore, log *slog.Logger) *Handlers {
+// NewHandlers wires the search-flow handlers. They carry no chat of their
+// own: every reply goes back to the chat the update came from, which is what
+// keeps two allowed chats from reading each other's answers. A nil log falls
+// back to slog.Default().
+func NewHandlers(searcher Searcher, trans transmission.Interface, subs SubscriptionStore, log *slog.Logger) *Handlers {
 	if log == nil {
 		log = slog.Default()
 	}
 	return &Handlers{
-		chatID:   chatID,
 		searcher: searcher,
 		trans:    trans,
 		subs:     subs,
@@ -75,26 +75,27 @@ func (h *Handlers) HandleText(ctx context.Context, api telegramAPI, update *mode
 	if query == "" {
 		return
 	}
+	chatID := update.Message.Chat.ID
 	if strings.HasPrefix(query, "/") {
-		h.handleCommand(ctx, api, query)
+		h.handleCommand(ctx, api, chatID, query)
 		return
 	}
 
-	ack := h.ackSearching(ctx, api, query)
+	ack := h.ackSearching(ctx, api, chatID, query)
 
 	releases, err := h.searcher.Search(ctx, query)
 	if err != nil {
-		h.answer(ctx, api, ack, "Search failed: "+err.Error(), nil)
+		h.answer(ctx, api, chatID, ack, "Search failed: "+err.Error(), nil)
 		return
 	}
 	if len(releases) == 0 {
-		h.answer(ctx, api, ack, fmt.Sprintf("No results for «%s».", query), nil)
+		h.answer(ctx, api, chatID, ack, fmt.Sprintf("No results for «%s».", query), nil)
 		return
 	}
 
 	id := h.cache.Put(cachedSearch{Query: query, Releases: releases})
 	marks := h.pageMarks(ctx, releases, 0)
-	h.answer(ctx, api, ack,
+	h.answer(ctx, api, chatID, ack,
 		resultsMessage(query, releases, 0, marks),
 		resultsKeyboard(id, releases, 0, marks))
 }
@@ -161,15 +162,15 @@ func (h *Handlers) pageMarks(ctx context.Context, releases []prowlarr.Release, p
 // the query was picked up: a search regularly runs for minutes (a cold
 // FlareSolverr Cloudflare challenge alone measured ~193 s) and a silent bot
 // looks stuck.
-func (h *Handlers) ackSearching(ctx context.Context, api telegramAPI, query string) int {
-	return h.ack(ctx, api, fmt.Sprintf("🔎 Searching «%s»…", query))
+func (h *Handlers) ackSearching(ctx context.Context, api telegramAPI, chatID int64, query string) int {
+	return h.ack(ctx, api, chatID, fmt.Sprintf("🔎 Searching «%s»…", query))
 }
 
 // ack posts a placeholder message and returns the ID to edit the real answer
 // into, or 0 when it could not be sent — losing the ack must never cost the
 // user their answer.
-func (h *Handlers) ack(ctx context.Context, api telegramAPI, text string) int {
-	msg, err := api.SendMessage(ctx, &bot.SendMessageParams{ChatID: h.chatID, Text: text})
+func (h *Handlers) ack(ctx context.Context, api telegramAPI, chatID int64, text string) int {
+	msg, err := api.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: text})
 	if err != nil {
 		h.log.Warn("send ack", "error", err)
 		return 0
@@ -183,10 +184,10 @@ func (h *Handlers) ack(ctx context.Context, api telegramAPI, text string) int {
 // never chunked; resultsMessage and detailsMessage are what keep those inside
 // Telegram's limit. The nil-keyboard path still routes through h.reply for the
 // odd long error.
-func (h *Handlers) answer(ctx context.Context, api telegramAPI, ack int, text string, kb models.ReplyMarkup) {
+func (h *Handlers) answer(ctx context.Context, api telegramAPI, chatID int64, ack int, text string, kb models.ReplyMarkup) {
 	if ack != 0 {
 		_, err := api.EditMessageText(ctx, &bot.EditMessageTextParams{
-			ChatID:      h.chatID,
+			ChatID:      chatID,
 			MessageID:   ack,
 			Text:        text,
 			ReplyMarkup: kb,
@@ -197,10 +198,10 @@ func (h *Handlers) answer(ctx context.Context, api telegramAPI, ack int, text st
 		h.log.Warn("edit ack", "error", err)
 	}
 	if kb == nil {
-		h.reply(ctx, api, text)
+		h.reply(ctx, api, chatID, text)
 		return
 	}
-	if _, err := api.SendMessage(ctx, &bot.SendMessageParams{ChatID: h.chatID, Text: text, ReplyMarkup: kb}); err != nil {
+	if _, err := api.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: text, ReplyMarkup: kb}); err != nil {
 		h.log.Error("send answer", "error", err)
 	}
 }
@@ -213,6 +214,7 @@ func (h *Handlers) HandleCallback(ctx context.Context, api telegramAPI, update *
 	if cb == nil {
 		return
 	}
+	chatID := updateChatID(update)
 	// Stop the button spinner right away; fetching a torrent can take a while.
 	if _, err := api.AnswerCallbackQuery(ctx, &bot.AnswerCallbackQueryParams{CallbackQueryID: cb.ID}); err != nil {
 		h.log.Warn("answer callback query", "error", err)
@@ -225,24 +227,24 @@ func (h *Handlers) HandleCallback(ctx context.Context, api telegramAPI, update *
 	}
 	entry, ok := h.cache.Get(searchID)
 	if !ok {
-		h.reply(ctx, api, "That search has expired — please send the query again.")
+		h.reply(ctx, api, chatID, "That search has expired — please send the query again.")
 		return
 	}
 
 	switch kind {
 	case cbPage:
-		h.flipPage(ctx, api, cb, searchID, entry, n)
+		h.flipPage(ctx, api, cb, chatID, searchID, entry, n)
 	case cbDownload:
-		h.download(ctx, api, entry, n)
+		h.download(ctx, api, chatID, entry, n)
 	case cbInfo:
-		h.details(ctx, api, searchID, entry, n)
+		h.details(ctx, api, chatID, searchID, entry, n)
 	default:
 		h.log.Warn("unknown callback kind", "data", cb.Data)
 	}
 }
 
 // flipPage swaps the result message's keyboard (and header) to another page.
-func (h *Handlers) flipPage(ctx context.Context, api telegramAPI, cb *models.CallbackQuery, searchID string, entry cachedSearch, page int) {
+func (h *Handlers) flipPage(ctx context.Context, api telegramAPI, cb *models.CallbackQuery, chatID int64, searchID string, entry cachedSearch, page int) {
 	page = clampPage(len(entry.Releases), page)
 	marks := h.pageMarks(ctx, entry.Releases, page)
 	text := resultsMessage(entry.Query, entry.Releases, page, marks)
@@ -250,7 +252,7 @@ func (h *Handlers) flipPage(ctx context.Context, api telegramAPI, cb *models.Cal
 
 	if msg := cb.Message.Message; msg != nil {
 		_, err := api.EditMessageText(ctx, &bot.EditMessageTextParams{
-			ChatID:      h.chatID,
+			ChatID:      chatID,
 			MessageID:   msg.ID,
 			Text:        text,
 			ReplyMarkup: kb,
@@ -261,7 +263,7 @@ func (h *Handlers) flipPage(ctx context.Context, api telegramAPI, cb *models.Cal
 		h.log.Warn("edit results page", "error", err)
 	}
 	// Original message unavailable (or edit failed): send the page fresh.
-	if _, err := api.SendMessage(ctx, &bot.SendMessageParams{ChatID: h.chatID, Text: text, ReplyMarkup: kb}); err != nil {
+	if _, err := api.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: text, ReplyMarkup: kb}); err != nil {
 		h.log.Error("send results page", "error", err)
 	}
 }
@@ -271,20 +273,20 @@ func (h *Handlers) flipPage(ctx context.Context, api telegramAPI, cb *models.Cal
 // indexer says about it, and the file list read out of the .torrent. It is
 // sent as its own message carrying a download button, so the results message —
 // and the search behind it — stays intact underneath.
-func (h *Handlers) details(ctx context.Context, api telegramAPI, searchID string, entry cachedSearch, idx int) {
+func (h *Handlers) details(ctx context.Context, api telegramAPI, chatID int64, searchID string, entry cachedSearch, idx int) {
 	if idx < 0 || idx >= len(entry.Releases) {
-		h.reply(ctx, api, "That result is no longer available — please search again.")
+		h.reply(ctx, api, chatID, "That result is no longer available — please search again.")
 		return
 	}
 	r := entry.Releases[idx]
 
 	// Fetching the .torrent goes through Prowlarr and the tracker, so it is
 	// slow often enough to deserve the same ack a search gets.
-	ack := h.ack(ctx, api, fmt.Sprintf("📄 Reading «%s»…", truncate(r.Title, maxHeaderQueryRunes)))
+	ack := h.ack(ctx, api, chatID, fmt.Sprintf("📄 Reading «%s»…", truncate(r.Title, maxHeaderQueryRunes)))
 
 	meta, unavailable := h.releaseMeta(ctx, r)
 	marks := h.pageMarks(ctx, entry.Releases, idx/perPage)
-	h.answer(ctx, api, ack,
+	h.answer(ctx, api, chatID, ack,
 		detailsMessage(idx+1, r, marks[idx], meta, unavailable),
 		detailsKeyboard(searchID, idx))
 }
@@ -325,31 +327,31 @@ func detailsKeyboard(searchID string, idx int) *models.InlineKeyboardMarkup {
 }
 
 // download hands the tapped release to Transmission and confirms in chat.
-func (h *Handlers) download(ctx context.Context, api telegramAPI, entry cachedSearch, idx int) {
+func (h *Handlers) download(ctx context.Context, api telegramAPI, chatID int64, entry cachedSearch, idx int) {
 	if idx < 0 || idx >= len(entry.Releases) {
-		h.reply(ctx, api, "That result is no longer available — please search again.")
+		h.reply(ctx, api, chatID, "That result is no longer available — please search again.")
 		return
 	}
 	r := entry.Releases[idx]
 
 	hash, err := grab.AddRelease(ctx, h.searcher, h.trans, r)
 	if err != nil {
-		h.reply(ctx, api, fmt.Sprintf("Failed to add «%s»: %v", r.Title, err))
+		h.reply(ctx, api, chatID, fmt.Sprintf("Failed to add «%s»: %v", r.Title, err))
 		return
 	}
 	if err := h.subs.AddDownload(ctx, hash, r.Title, sourceSearch); err != nil {
 		// The torrent is already downloading; only completion notification is lost.
 		h.log.Error("record download", "hash", hash, "error", err)
 	}
-	h.reply(ctx, api, "⬇️ Added: "+r.Title)
+	h.reply(ctx, api, chatID, "⬇️ Added: "+r.Title)
 }
 
-// reply sends a plain-text message to the allowed chat, splitting texts past
-// Telegram's length limit into several messages so long lists (/subs,
-// /status) degrade gracefully instead of failing to send at all.
-func (h *Handlers) reply(ctx context.Context, api telegramAPI, text string) {
+// reply sends a plain-text message back to the chat that asked, splitting
+// texts past Telegram's length limit into several messages so long lists
+// (/subs, /status) degrade gracefully instead of failing to send at all.
+func (h *Handlers) reply(ctx context.Context, api telegramAPI, chatID int64, text string) {
 	for _, chunk := range splitMessage(text, maxMessageLen) {
-		if _, err := api.SendMessage(ctx, &bot.SendMessageParams{ChatID: h.chatID, Text: chunk}); err != nil {
+		if _, err := api.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: chunk}); err != nil {
 			h.log.Error("send message", "error", err)
 			return
 		}

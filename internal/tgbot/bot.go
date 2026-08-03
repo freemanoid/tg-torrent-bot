@@ -1,12 +1,14 @@
-// Package tgbot implements the Telegram side of the bot: the single-chat
-// allowlist, the plain-text search flow with inline-keyboard results, and the
-// callback handlers that hand releases to Transmission.
+// Package tgbot implements the Telegram side of the bot: the chat allowlist,
+// the plain-text search flow with inline-keyboard results, and the callback
+// handlers that hand releases to Transmission.
 package tgbot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 
 	"github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
@@ -14,18 +16,18 @@ import (
 
 // Bot wires Handlers into a go-telegram/bot long-polling client.
 type Bot struct {
-	api    *bot.Bot
-	chatID int64
-	log    *slog.Logger
+	api     *bot.Bot
+	chatIDs []int64
+	log     *slog.Logger
 }
 
-// New builds the Telegram bot: every update must pass the allowed-chat check,
-// callback queries go to the keyboard handler, and any unmatched text message
-// is treated as a search query. Extra options (e.g. bot.WithSkipGetMe in
-// tests) are applied after the defaults.
-func New(token string, allowedChatID int64, h *Handlers, extra ...bot.Option) (*Bot, error) {
+// New builds the Telegram bot: every update must come from one of the allowed
+// chats, callback queries go to the keyboard handler, and any unmatched text
+// message is treated as a search query. Extra options (e.g. bot.WithSkipGetMe
+// in tests) are applied after the defaults.
+func New(token string, allowedChatIDs []int64, h *Handlers, extra ...bot.Option) (*Bot, error) {
 	opts := append([]bot.Option{
-		bot.WithMiddlewares(allowChat(allowedChatID)),
+		bot.WithMiddlewares(allowChats(allowedChatIDs)),
 		bot.WithCallbackQueryDataHandler("", bot.MatchTypePrefix, func(ctx context.Context, b *bot.Bot, update *models.Update) {
 			h.HandleCallback(ctx, b, update)
 		}),
@@ -38,14 +40,27 @@ func New(token string, allowedChatID int64, h *Handlers, extra ...bot.Option) (*
 	if err != nil {
 		return nil, fmt.Errorf("create telegram bot: %w", err)
 	}
-	return &Bot{api: api, chatID: allowedChatID, log: h.log}, nil
+	return &Bot{api: api, chatIDs: slices.Clone(allowedChatIDs), log: h.log}, nil
 }
 
-// Notify sends a plain-text message to the allowed chat. It makes *Bot the
+// Notify sends a plain-text message to every allowed chat. It makes *Bot the
 // production Notifier for the subscription engine and completion watcher.
+// Subscriptions and downloads belong to the install rather than to whoever
+// created them, so everyone on the allowlist hears about them.
+//
+// A chat that cannot be reached — blocked bot, deleted group — costs only its
+// own message: the others are still sent, and an error comes back only when
+// none got through, so one broken chat cannot silence the rest.
 func (b *Bot) Notify(ctx context.Context, text string) error {
-	if _, err := b.api.SendMessage(ctx, &bot.SendMessageParams{ChatID: b.chatID, Text: text}); err != nil {
-		return fmt.Errorf("telegram notify: %w", err)
+	var errs []error
+	for _, id := range b.chatIDs {
+		if _, err := b.api.SendMessage(ctx, &bot.SendMessageParams{ChatID: id, Text: text}); err != nil {
+			b.log.Warn("telegram notify", "chat_id", id, "error", err)
+			errs = append(errs, err)
+		}
+	}
+	if len(errs) == len(b.chatIDs) && len(errs) > 0 {
+		return fmt.Errorf("telegram notify: %w", errors.Join(errs...))
 	}
 	return nil
 }
@@ -60,12 +75,14 @@ func (b *Bot) Run(ctx context.Context) {
 	b.api.Start(ctx)
 }
 
-// allowChat drops every update that does not originate from the allowed chat.
-// Unauthorized senders get no reply at all — the bot stays invisible to them.
-func allowChat(allowed int64) bot.Middleware {
+// allowChats drops every update that does not originate from one of the
+// allowed chats. Unauthorized senders get no reply at all — the bot stays
+// invisible to them.
+func allowChats(allowed []int64) bot.Middleware {
+	allowed = slices.Clone(allowed)
 	return func(next bot.HandlerFunc) bot.HandlerFunc {
 		return func(ctx context.Context, b *bot.Bot, update *models.Update) {
-			if update == nil || updateChatID(update) != allowed {
+			if update == nil || !slices.Contains(allowed, updateChatID(update)) {
 				return
 			}
 			next(ctx, b, update)
@@ -75,9 +92,8 @@ func allowChat(allowed int64) bot.Middleware {
 
 // updateChatID extracts the originating chat ID from the update kinds the bot
 // consumes — plain messages and callback queries — or 0 for anything else
-// (config.Load rejects ALLOWED_CHAT_ID=0, so such updates are always
-// dropped). Edited messages deliberately fall through to 0: no handler
-// consumes them.
+// (config rejects 0 in the allowlist, so such updates are always dropped).
+// Edited messages deliberately fall through to 0: no handler consumes them.
 func updateChatID(u *models.Update) int64 {
 	switch {
 	case u.Message != nil:

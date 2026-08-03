@@ -13,14 +13,33 @@ import (
 // DBPath is deliberately absent: the database location is infrastructure,
 // configured only via the DB_PATH environment variable.
 type fileConfig struct {
-	TelegramToken    string `json:"telegram_token"`
-	AllowedChatID    int64  `json:"allowed_chat_id"`
+	TelegramToken  string  `json:"telegram_token"`
+	AllowedChatIDs []int64 `json:"allowed_chat_ids"`
+	// AllowedChatID is the pre-1.8 single-chat key, read only when
+	// allowed_chat_ids is absent so an install written by an older version
+	// keeps its allowlist across the upgrade. Save never writes it back.
+	AllowedChatID    int64  `json:"allowed_chat_id,omitempty"`
 	ProwlarrURL      string `json:"prowlarr_url"`
 	ProwlarrAPIKey   string `json:"prowlarr_api_key"`
 	TransmissionURL  string `json:"transmission_url"`
 	TransmissionUser string `json:"transmission_user,omitempty"`
 	TransmissionPass string `json:"transmission_pass,omitempty"`
 	SubInterval      string `json:"sub_interval,omitempty"` // Go duration, e.g. "20m"
+}
+
+// allowedChatIDs returns the allowlist the file carries, preferring the
+// current plural key and falling back to the legacy singular one. A stored 0
+// is dropped rather than kept: in the old schema it was indistinguishable
+// from an absent value, and Validate then reports the field missing, which
+// is what starts the settings page instead of failing the boot.
+func (fc fileConfig) allowedChatIDs() []int64 {
+	if len(fc.AllowedChatIDs) > 0 {
+		return fc.AllowedChatIDs
+	}
+	if fc.AllowedChatID != 0 {
+		return []int64{fc.AllowedChatID}
+	}
+	return nil
 }
 
 // LoadFrom loads configuration file-first: when the file at path exists it is
@@ -45,7 +64,7 @@ func LoadFrom(path string) (*Config, error) {
 
 	cfg := &Config{
 		TelegramToken:    fc.TelegramToken,
-		AllowedChatID:    fc.AllowedChatID,
+		AllowedChatIDs:   fc.allowedChatIDs(),
 		ProwlarrURL:      fc.ProwlarrURL,
 		ProwlarrAPIKey:   fc.ProwlarrAPIKey,
 		TransmissionURL:  fc.TransmissionURL,
@@ -79,7 +98,7 @@ func LoadFrom(path string) (*Config, error) {
 func (c *Config) Save(path string) error {
 	fc := fileConfig{
 		TelegramToken:    c.TelegramToken,
-		AllowedChatID:    c.AllowedChatID,
+		AllowedChatIDs:   c.AllowedChatIDs,
 		ProwlarrURL:      c.ProwlarrURL,
 		ProwlarrAPIKey:   c.ProwlarrAPIKey,
 		TransmissionURL:  c.TransmissionURL,

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -21,7 +22,7 @@ const (
 // Config holds all runtime configuration for the bot.
 type Config struct {
 	TelegramToken    string        // TELEGRAM_TOKEN: bot token from @BotFather
-	AllowedChatID    int64         // ALLOWED_CHAT_ID: single-user allowlist
+	AllowedChatIDs   []int64       // ALLOWED_CHAT_ID: comma-separated chat allowlist
 	ProwlarrURL      string        // PROWLARR_URL: e.g. http://umbrel.local:9696
 	ProwlarrAPIKey   string        // PROWLARR_API_KEY
 	TransmissionURL  string        // TRANSMISSION_URL: e.g. http://umbrel.local:9091
@@ -77,13 +78,11 @@ func Load() (*Config, error) {
 	}
 
 	var err error
-	if cfg.AllowedChatID, err = strconv.ParseInt(chatID, 10, 64); err != nil {
-		return nil, fmt.Errorf("ALLOWED_CHAT_ID must be an integer chat ID, got %q", chatID)
+	if cfg.AllowedChatIDs, err = ParseChatIDs(chatID); err != nil {
+		return nil, fmt.Errorf("ALLOWED_CHAT_ID: %w", err)
 	}
-	if cfg.AllowedChatID == 0 {
-		// 0 is the "update carries no chat" sentinel in the allowlist
-		// middleware; a real Telegram chat never has ID 0.
-		return nil, fmt.Errorf("ALLOWED_CHAT_ID must be a real chat ID, got 0")
+	if len(cfg.AllowedChatIDs) == 0 {
+		return nil, &ErrIncomplete{Missing: []string{"ALLOWED_CHAT_ID"}}
 	}
 
 	cfg.DBPath = os.Getenv("DB_PATH")
@@ -115,7 +114,7 @@ func (c *Config) Validate() error {
 	var missing []string
 	for _, v := range []struct{ name, value string }{
 		{"telegram_token", c.TelegramToken},
-		{"allowed_chat_id", chatIDValue(c.AllowedChatID)},
+		{"allowed_chat_ids", FormatChatIDs(c.AllowedChatIDs)},
 		{"prowlarr_url", c.ProwlarrURL},
 		{"prowlarr_api_key", c.ProwlarrAPIKey},
 		{"transmission_url", c.TransmissionURL},
@@ -128,6 +127,13 @@ func (c *Config) Validate() error {
 		return &ErrIncomplete{Missing: missing}
 	}
 
+	for _, id := range c.AllowedChatIDs {
+		if id == 0 {
+			// 0 is the "update carries no chat" sentinel in the allowlist
+			// middleware; a real Telegram chat never has ID 0.
+			return fmt.Errorf("allowed_chat_ids must be real chat IDs, got 0")
+		}
+	}
 	if err := validateURL("prowlarr_url", c.ProwlarrURL); err != nil {
 		return err
 	}
@@ -142,13 +148,43 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-// chatIDValue maps the "no chat id" sentinel 0 to an empty string so the
-// missing-field loop can treat all required fields uniformly.
-func chatIDValue(id int64) string {
-	if id == 0 {
-		return ""
+// ParseChatIDs reads a comma-separated chat allowlist, as written in
+// ALLOWED_CHAT_ID or typed into the settings form. Blank entries are skipped
+// so a stray trailing comma is not an error, and repeats are dropped so a
+// chat listed twice is not notified twice. An empty input yields no IDs and
+// no error — "absent" is Validate's business, not the parser's.
+func ParseChatIDs(raw string) ([]int64, error) {
+	var ids []int64
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		id, err := strconv.ParseInt(part, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("must be comma-separated integer chat IDs, got %q", part)
+		}
+		if id == 0 {
+			// 0 is the "update carries no chat" sentinel in the allowlist
+			// middleware; a real Telegram chat never has ID 0.
+			return nil, fmt.Errorf("must be real chat IDs, got 0")
+		}
+		if !slices.Contains(ids, id) {
+			ids = append(ids, id)
+		}
 	}
-	return strconv.FormatInt(id, 10)
+	return ids, nil
+}
+
+// FormatChatIDs renders a chat allowlist the way ParseChatIDs reads it, which
+// is also how the settings form shows it. An empty list yields an empty
+// string, so the missing-field loop can treat it like any other absent value.
+func FormatChatIDs(ids []int64) string {
+	parts := make([]string, len(ids))
+	for i, id := range ids {
+		parts[i] = strconv.FormatInt(id, 10)
+	}
+	return strings.Join(parts, ",")
 }
 
 func validateURL(field, raw string) error {

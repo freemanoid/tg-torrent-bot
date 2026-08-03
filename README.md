@@ -23,8 +23,10 @@ After an app update the bot posts what it is now running — the new version and
 that version's [CHANGELOG.md](CHANGELOG.md) entry — once per release, so a
 silent container restart no longer hides what arrived.
 
-Only one chat ID is allowed to talk to the bot; every other update is dropped
-silently.
+Only the chat IDs on the allowlist can talk to the bot; every other update is
+dropped silently. List several to share one bot with a household — each search
+is answered in the chat that asked, while subscription and completion notices
+go to everyone.
 
 ## Architecture
 
@@ -111,7 +113,7 @@ The page has no login of its own: Umbrel's app proxy already gates it, exactly
 like every other app.
 
 1. Open the app from the Umbrel dashboard.
-2. Fill in the Telegram token, allowed chat ID, Prowlarr and Transmission
+2. Fill in the Telegram token, allowed chat IDs, Prowlarr and Transmission
    URLs, the Prowlarr API key, and (optionally) Transmission credentials and
    the subscription interval.
 3. Save. The bot writes the settings and restarts to apply them; the page
@@ -126,8 +128,11 @@ Details worth knowing:
   one, it is the only source for the values below; the environment is used
   only when the file is absent. `DB_PATH` and `CONFIG_PATH` are the exception —
   they are infrastructure and stay environment-only.
-- **Secrets are never echoed back.** The token, API key and password render as
-  empty password fields; leaving one blank keeps the stored value.
+- **Every value is shown in full**, tokens and passwords included, so they can
+  be read off the page and copied. There is nothing to hide from: the page is
+  already behind Umbrel's app proxy. A submission is therefore the whole
+  configuration — clearing a field clears the setting rather than keeping the
+  stored value.
 - **Saving restarts the bot.** There is no hot reload: the process exits
   non-zero and the container restart policy starts it again with the new
   configuration. Downtime is a couple of seconds; SQLite and the Telegram
@@ -146,7 +151,7 @@ page saves a file.
 | Var | Required | Meaning |
 |---|---|---|
 | `TELEGRAM_TOKEN` | yes | Bot token from [@BotFather](https://t.me/BotFather) |
-| `ALLOWED_CHAT_ID` | yes | Single-user allowlist; get yours from [@userinfobot](https://t.me/userinfobot) |
+| `ALLOWED_CHAT_ID` | yes | Chat allowlist, comma-separated for several chats; get yours from [@userinfobot](https://t.me/userinfobot) |
 | `PROWLARR_URL` | yes | e.g. `http://umbrel.local:9696` |
 | `PROWLARR_API_KEY` | yes | Prowlarr → Settings → General → API Key |
 | `TRANSMISSION_URL` | yes | e.g. `http://umbrel.local:9091` |

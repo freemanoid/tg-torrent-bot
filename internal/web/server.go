@@ -13,7 +13,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
@@ -99,21 +98,23 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 }
 
-// formView is the template data for the settings form. Secret values are
-// never part of it — only Has* flags — so they cannot leak into the HTML.
+// formView is the template data for the settings form. Tokens and passwords
+// are part of it and are rendered in full: the page is reachable only behind
+// Umbrel's app proxy (or on loopback under plain compose), and a value you
+// can see is a value you can copy into Prowlarr or a second bot without
+// digging /data/config.json out of the host.
 type formView struct {
 	Unconfigured bool
 	Error        string
 
-	AllowedChatID    string
+	TelegramToken    string
+	AllowedChatIDs   string
 	ProwlarrURL      string
+	ProwlarrAPIKey   string
 	TransmissionURL  string
 	TransmissionUser string
+	TransmissionPass string
 	SubInterval      string
-
-	HasTelegramToken    bool
-	HasProwlarrAPIKey   bool
-	HasTransmissionPass bool
 }
 
 func (s *Server) handleForm(w http.ResponseWriter, _ *http.Request) {
@@ -127,55 +128,48 @@ func (s *Server) handleSave(w http.ResponseWriter, r *http.Request) {
 	}
 	field := func(name string) string { return strings.TrimSpace(r.PostForm.Get(name)) }
 
-	// re-render view keeps everything the user typed except secrets
+	// re-render view keeps everything the user typed, secrets included: they
+	// are shown in the form anyway, and dropping them would make a rejected
+	// save cost the user a re-paste of the token.
 	view := formView{
-		Unconfigured:        s.cfg == nil,
-		AllowedChatID:       field("allowed_chat_id"),
-		ProwlarrURL:         field("prowlarr_url"),
-		TransmissionURL:     field("transmission_url"),
-		TransmissionUser:    field("transmission_user"),
-		SubInterval:         field("sub_interval"),
-		HasTelegramToken:    s.cfg != nil && s.cfg.TelegramToken != "",
-		HasProwlarrAPIKey:   s.cfg != nil && s.cfg.ProwlarrAPIKey != "",
-		HasTransmissionPass: s.cfg != nil && s.cfg.TransmissionPass != "",
+		Unconfigured:     s.cfg == nil,
+		TelegramToken:    field("telegram_token"),
+		AllowedChatIDs:   field("allowed_chat_ids"),
+		ProwlarrURL:      field("prowlarr_url"),
+		ProwlarrAPIKey:   field("prowlarr_api_key"),
+		TransmissionURL:  field("transmission_url"),
+		TransmissionUser: field("transmission_user"),
+		TransmissionPass: field("transmission_pass"),
+		SubInterval:      field("sub_interval"),
 	}
 	fail := func(msg string) {
 		view.Error = msg
 		s.render(w, http.StatusUnprocessableEntity, "page", view)
 	}
 
+	// The form carries every field, secrets included, so what it submits is
+	// the whole configuration — there is no keep-the-current-value fallback,
+	// which is what makes clearing an optional password possible.
 	cand := &config.Config{
-		TelegramToken:    field("telegram_token"),
+		TelegramToken:    view.TelegramToken,
 		ProwlarrURL:      view.ProwlarrURL,
-		ProwlarrAPIKey:   field("prowlarr_api_key"),
+		ProwlarrAPIKey:   view.ProwlarrAPIKey,
 		TransmissionURL:  view.TransmissionURL,
 		TransmissionUser: view.TransmissionUser,
-		TransmissionPass: field("transmission_pass"),
+		TransmissionPass: view.TransmissionPass,
 		DBPath:           config.DefaultDBPath,
 		SubInterval:      config.DefaultSubInterval,
 	}
 	if s.cfg != nil {
 		cand.DBPath = s.cfg.DBPath
-		// blank secret fields keep the current values
-		if cand.TelegramToken == "" {
-			cand.TelegramToken = s.cfg.TelegramToken
-		}
-		if cand.ProwlarrAPIKey == "" {
-			cand.ProwlarrAPIKey = s.cfg.ProwlarrAPIKey
-		}
-		if cand.TransmissionPass == "" {
-			cand.TransmissionPass = s.cfg.TransmissionPass
-		}
 	}
 
-	if v := view.AllowedChatID; v != "" {
-		id, err := strconv.ParseInt(v, 10, 64)
-		if err != nil {
-			fail(fmt.Sprintf("allowed_chat_id must be an integer chat ID, got %q", v))
-			return
-		}
-		cand.AllowedChatID = id
+	ids, err := config.ParseChatIDs(view.AllowedChatIDs)
+	if err != nil {
+		fail(fmt.Sprintf("allowed_chat_ids %v", err))
+		return
 	}
+	cand.AllowedChatIDs = ids
 	if v := view.SubInterval; v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
@@ -210,14 +204,14 @@ func (s *Server) currentView() formView {
 		}
 	}
 	return formView{
-		AllowedChatID:       strconv.FormatInt(s.cfg.AllowedChatID, 10),
-		ProwlarrURL:         s.cfg.ProwlarrURL,
-		TransmissionURL:     s.cfg.TransmissionURL,
-		TransmissionUser:    s.cfg.TransmissionUser,
-		SubInterval:         formatDuration(s.cfg.SubInterval),
-		HasTelegramToken:    s.cfg.TelegramToken != "",
-		HasProwlarrAPIKey:   s.cfg.ProwlarrAPIKey != "",
-		HasTransmissionPass: s.cfg.TransmissionPass != "",
+		TelegramToken:    s.cfg.TelegramToken,
+		AllowedChatIDs:   config.FormatChatIDs(s.cfg.AllowedChatIDs),
+		ProwlarrURL:      s.cfg.ProwlarrURL,
+		ProwlarrAPIKey:   s.cfg.ProwlarrAPIKey,
+		TransmissionURL:  s.cfg.TransmissionURL,
+		TransmissionUser: s.cfg.TransmissionUser,
+		TransmissionPass: s.cfg.TransmissionPass,
+		SubInterval:      formatDuration(s.cfg.SubInterval),
 	}
 }
 
@@ -273,23 +267,22 @@ button{margin-top:1.5rem;padding:.5rem 1.5rem;font-size:1rem}
 {{if .Error}}<p class="error">{{.Error}}</p>{{end}}
 <form method="post" action="/">
 <label for="telegram_token">Telegram bot token</label>
-<input type="password" id="telegram_token" name="telegram_token" value="" autocomplete="off">
-{{if .HasTelegramToken}}<p class="hint">Leave blank to keep the current value.</p>{{else}}<p class="hint">From @BotFather, e.g. 123456:ABC-DEF…</p>{{end}}
-<label for="allowed_chat_id">Allowed chat ID</label>
-<input type="text" id="allowed_chat_id" name="allowed_chat_id" value="{{.AllowedChatID}}">
-<p class="hint">The single Telegram chat the bot answers to.</p>
+<input type="text" id="telegram_token" name="telegram_token" value="{{.TelegramToken}}" autocomplete="off" spellcheck="false">
+<p class="hint">From @BotFather, e.g. 123456:ABC-DEF…</p>
+<label for="allowed_chat_ids">Allowed chat IDs</label>
+<input type="text" id="allowed_chat_ids" name="allowed_chat_ids" value="{{.AllowedChatIDs}}" spellcheck="false">
+<p class="hint">Comma-separated; every other chat is ignored. Get yours from @userinfobot — group IDs are negative.</p>
 <label for="prowlarr_url">Prowlarr URL</label>
 <input type="text" id="prowlarr_url" name="prowlarr_url" value="{{.ProwlarrURL}}" placeholder="http://umbrel.local:9696">
 <label for="prowlarr_api_key">Prowlarr API key</label>
-<input type="password" id="prowlarr_api_key" name="prowlarr_api_key" value="" autocomplete="off">
-{{if .HasProwlarrAPIKey}}<p class="hint">Leave blank to keep the current value.</p>{{else}}<p class="hint">Prowlarr → Settings → General → API Key.</p>{{end}}
+<input type="text" id="prowlarr_api_key" name="prowlarr_api_key" value="{{.ProwlarrAPIKey}}" autocomplete="off" spellcheck="false">
+<p class="hint">Prowlarr → Settings → General → API Key.</p>
 <label for="transmission_url">Transmission URL</label>
 <input type="text" id="transmission_url" name="transmission_url" value="{{.TransmissionURL}}" placeholder="http://umbrel.local:9091">
 <label for="transmission_user">Transmission username (optional)</label>
 <input type="text" id="transmission_user" name="transmission_user" value="{{.TransmissionUser}}">
 <label for="transmission_pass">Transmission password (optional)</label>
-<input type="password" id="transmission_pass" name="transmission_pass" value="" autocomplete="off">
-{{if .HasTransmissionPass}}<p class="hint">Leave blank to keep the current value.</p>{{end}}
+<input type="text" id="transmission_pass" name="transmission_pass" value="{{.TransmissionPass}}" autocomplete="off" spellcheck="false">
 <label for="sub_interval">Subscription check interval</label>
 <input type="text" id="sub_interval" name="sub_interval" value="{{.SubInterval}}">
 <p class="hint">Go duration, e.g. 20m or 1h30m.</p>

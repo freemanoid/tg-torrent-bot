@@ -5,6 +5,18 @@ the binary: after an update the bot posts the entry matching the version it is
 running, so keep entries short, plain, and headed `## v<version>` — the same
 version the git tag carries.
 
+## v1.8.0
+
+- The settings page now takes a list of allowed chat IDs, not just one, so the
+  bot can be shared — with a partner, a family group, a second device. Each
+  search is answered in the chat that asked for it; subscription grabs and
+  "finished" notices go to everyone on the list.
+- The settings page shows the bot token, Prowlarr API key and Transmission
+  password in full instead of blank boxes, so they can be read and copied
+  straight from the form. Because every value is now visible, saving stores
+  exactly what the form shows: emptying a field clears that setting rather
+  than keeping the old value.
+
 ## v1.7.0
 
 - Search results now carry 🔗 buttons: tap one to open that release's page on

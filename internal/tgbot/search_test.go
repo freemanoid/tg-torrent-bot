@@ -18,7 +18,10 @@ import (
 	"github.com/freemanoid/tg-torrent-bot/internal/transmission"
 )
 
-const testChatID = int64(42)
+const (
+	testChatID   = int64(42)
+	secondChatID = int64(-1001234567890)
+)
 
 // --- fakes ---
 
@@ -145,13 +148,33 @@ type recordedDownload struct{ hash, title, source string }
 // tests can assert on recorded downloads.
 func newTestHandlers(s *fakeSearcher, tr *fakeTrans) (*Handlers, *fakeSubStore) {
 	subs := newFakeSubStore()
-	return NewHandlers(testChatID, s, tr, subs, slog.New(slog.DiscardHandler)), subs
+	return NewHandlers(s, tr, subs, slog.New(slog.DiscardHandler)), subs
 }
 
 func textUpdate(text string) *models.Update {
 	return &models.Update{Message: &models.Message{
 		Text: text,
 		Chat: models.Chat{ID: testChatID},
+	}}
+}
+
+// textUpdateFrom is textUpdate for a specific allowed chat, used by the tests
+// that check an answer goes back to whoever asked.
+func textUpdateFrom(chatID int64, text string) *models.Update {
+	return &models.Update{Message: &models.Message{
+		Text: text,
+		Chat: models.Chat{ID: chatID},
+	}}
+}
+
+func callbackUpdateFrom(chatID int64, data string) *models.Update {
+	return &models.Update{CallbackQuery: &models.CallbackQuery{
+		ID:   "cb1",
+		Data: data,
+		Message: models.MaybeInaccessibleMessage{
+			Type:    models.MaybeInaccessibleMessageTypeMessage,
+			Message: &models.Message{ID: 7, Chat: models.Chat{ID: chatID}},
+		},
 	}}
 }
 
@@ -1085,7 +1108,7 @@ func TestReplyAbortsAfterSendFailure(t *testing.T) {
 	// Three chunks' worth of text: once the first send fails, the remaining
 	// chunks must not be attempted.
 	text := strings.TrimSuffix(strings.Repeat(strings.Repeat("x", maxMessageLen-1)+"\n", 3), "\n")
-	h.reply(context.Background(), tg, text)
+	h.reply(context.Background(), tg, testChatID, text)
 
 	if tg.sendCalls != 1 {
 		t.Errorf("send attempts = %d, want 1 (abort after the first failure)", tg.sendCalls)
@@ -1093,6 +1116,81 @@ func TestReplyAbortsAfterSendFailure(t *testing.T) {
 	if len(tg.sent) != 0 {
 		t.Errorf("delivered %d messages, want 0", len(tg.sent))
 	}
+}
+
+// --- replies go back to whoever asked ---
+
+// chatIDsOf collects the destination of every message the fake was asked to
+// send or edit.
+func chatIDsOf(t *testing.T, tg *fakeTG) []any {
+	t.Helper()
+	tg.mu.Lock()
+	defer tg.mu.Unlock()
+	var ids []any
+	for _, p := range tg.sent {
+		ids = append(ids, p.ChatID)
+	}
+	for _, p := range tg.edited {
+		ids = append(ids, p.ChatID)
+	}
+	return ids
+}
+
+// wantOnlyChat fails unless every message went to chatID.
+func wantOnlyChat(t *testing.T, tg *fakeTG, chatID int64) {
+	t.Helper()
+	ids := chatIDsOf(t, tg)
+	if len(ids) == 0 {
+		t.Fatal("nothing was sent")
+	}
+	for _, got := range ids {
+		if got != any(chatID) {
+			t.Errorf("message addressed to chat %v, want %d", got, chatID)
+		}
+	}
+}
+
+func TestSearchAnswersTheChatThatAsked(t *testing.T) {
+	// With more than one allowed chat, a fixed reply destination would show
+	// one member's search results to another.
+	s := &fakeSearcher{releases: nReleases(3)}
+	h, _ := newTestHandlers(s, &fakeTrans{})
+	tg := &fakeTG{}
+
+	h.HandleText(context.Background(), tg, textUpdateFrom(secondChatID, "space show"))
+
+	wantOnlyChat(t, tg, secondChatID)
+}
+
+func TestCommandAnswersTheChatThatAsked(t *testing.T) {
+	h, _ := newTestHandlers(&fakeSearcher{}, &fakeTrans{})
+	tg := &fakeTG{}
+
+	h.HandleText(context.Background(), tg, textUpdateFrom(secondChatID, "/help"))
+
+	wantOnlyChat(t, tg, secondChatID)
+}
+
+func TestCallbackAnswersTheChatThatTapped(t *testing.T) {
+	h, _ := newTestHandlers(&fakeSearcher{}, &fakeTrans{})
+	id := h.cache.Put(cachedSearch{Query: "q", Releases: nReleases(12)})
+
+	tg := &fakeTG{}
+	h.HandleCallback(context.Background(), tg, callbackUpdateFrom(secondChatID, encodeCallback(cbPage, id, 1)))
+
+	wantOnlyChat(t, tg, secondChatID)
+}
+
+func TestDownloadConfirmsToTheChatThatTapped(t *testing.T) {
+	h, _ := newTestHandlers(&fakeSearcher{}, &fakeTrans{})
+	id := h.cache.Put(cachedSearch{Query: "q", Releases: []prowlarr.Release{{
+		Title: "Release", MagnetURL: "magnet:?xt=urn:btih:abc",
+	}}})
+
+	tg := &fakeTG{}
+	h.HandleCallback(context.Background(), tg, callbackUpdateFrom(secondChatID, encodeCallback(cbDownload, id, 0)))
+
+	wantOnlyChat(t, tg, secondChatID)
 }
 
 // --- auth middleware ---
@@ -1126,12 +1224,15 @@ func TestAllowChatMiddleware(t *testing.T) {
 			},
 		}}, true},
 		{"update without chat", &models.Update{}, false},
+		{"message from the second allowed chat", &models.Update{Message: &models.Message{
+			Text: "hi", Chat: models.Chat{ID: secondChatID},
+		}}, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			called := false
 			next := func(context.Context, *bot.Bot, *models.Update) { called = true }
-			allowChat(testChatID)(next)(context.Background(), nil, tt.update)
+			allowChats([]int64{testChatID, secondChatID})(next)(context.Background(), nil, tt.update)
 			if called != tt.want {
 				t.Errorf("handler called = %v, want %v", called, tt.want)
 			}
@@ -1143,7 +1244,7 @@ func TestAllowChatMiddleware(t *testing.T) {
 
 func TestNewBotOffline(t *testing.T) {
 	h, _ := newTestHandlers(&fakeSearcher{}, &fakeTrans{})
-	b, err := New("123:testtoken", testChatID, h, bot.WithSkipGetMe())
+	b, err := New("123:testtoken", []int64{testChatID}, h, bot.WithSkipGetMe())
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

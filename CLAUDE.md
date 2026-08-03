@@ -241,9 +241,10 @@ releases seen) and the test fake. Tests go in `commands_test.go`.
 **Add a config field** — five files, in this order: `internal/config/config.go`
 (struct, env parse in `Load`, `Validate` if required), `internal/config/file.go`
 (json tag, `LoadFrom` + `Save` mapping), `internal/web/server.go` (`formView`
-field, template input, POST parsing; if it is a secret add a `HasX` bool and
-never render the value), `.env.example`, README config table. Tests in all
-three packages.
+field, template input, POST parsing — secrets included: the form renders every
+value in full and a submission is the whole config, so there is no
+blank-keeps-current fallback to add), `.env.example`, README config table.
+Tests in all three packages.
 
 **Add a filter token type** — `internal/filter/filter.go`: `Parse` and `Match`,
 plus `String` so the `Parse ⇄ String` round-trip test still holds. Filters are
@@ -304,6 +305,20 @@ TTL.
 - **The settings page has no authentication of its own** — Umbrel's app proxy
   provides it, and plain compose binds it to `127.0.0.1`. Never add anything to
   it that would be unsafe behind a thin proxy.
+- **The settings page shows secrets in plain text on purpose.** The token, API
+  key and password render as ordinary text inputs so they can be copied
+  without SSH-ing to the host for `/data/config.json`; the proxy above is what
+  guards them. That makes a submission the *whole* configuration — blank means
+  blank, so clearing an optional password works. Don't reintroduce
+  masking or a blank-keeps-current fallback: together they made clearing a
+  value impossible.
+- **Replies go to the chat the update came from**, never to a stored one:
+  `Handlers` holds no chat ID at all, and the originating ID is threaded
+  through every send. The allowlist may hold several chats, and a fixed
+  destination would show one member's search results to another. Fan-out is
+  only for notifications nobody asked for by hand — `Bot.Notify` posts to
+  every allowed chat, because subscriptions and downloads belong to the
+  install, not to whoever created them.
 - **umbrelOS deletes non-app containers on boot** and reverts root-filesystem
   changes; only app-data and `/home` persist. That is why this ships as an
   Umbrel app rather than a standalone compose stack.

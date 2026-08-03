@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -31,7 +32,7 @@ func testConfig(t *testing.T, base string) *config.Config {
 	t.Helper()
 	return &config.Config{
 		TelegramToken:   "123:testtoken",
-		AllowedChatID:   42,
+		AllowedChatIDs:  []int64{42},
 		ProwlarrURL:     base,
 		ProwlarrAPIKey:  "key",
 		TransmissionURL: base,
@@ -384,7 +385,7 @@ func TestSettingsSaveWritesConfigFileAndRestarts(t *testing.T) {
 
 	form := url.Values{
 		"telegram_token":    {"123456:test-token"},
-		"allowed_chat_id":   {"42"},
+		"allowed_chat_ids":  {"42,7"},
 		"prowlarr_url":      {"http://umbrel.local:9696"},
 		"prowlarr_api_key":  {"prowlarr-key"},
 		"transmission_url":  {"http://umbrel.local:9091"},
@@ -410,7 +411,7 @@ func TestSettingsSaveWritesConfigFileAndRestarts(t *testing.T) {
 	}
 	want := &config.Config{
 		TelegramToken:    "123456:test-token",
-		AllowedChatID:    42,
+		AllowedChatIDs:   []int64{42, 7},
 		ProwlarrURL:      "http://umbrel.local:9696",
 		ProwlarrAPIKey:   "prowlarr-key",
 		TransmissionURL:  "http://umbrel.local:9091",
@@ -419,7 +420,7 @@ func TestSettingsSaveWritesConfigFileAndRestarts(t *testing.T) {
 		DBPath:           dbPath,
 		SubInterval:      30 * time.Minute,
 	}
-	if *got != *want {
+	if !reflect.DeepEqual(got, want) {
 		t.Errorf("config reloaded from %s:\n got %+v\nwant %+v", cfgPath, *got, *want)
 	}
 }

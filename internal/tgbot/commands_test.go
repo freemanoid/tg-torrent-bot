@@ -150,7 +150,7 @@ var _ SubscriptionStore = (*fakeSubStore)(nil)
 
 // newCommandHandlers wires Handlers with a specific fake subscription store.
 func newCommandHandlers(s *fakeSearcher, tr *fakeTrans, subs *fakeSubStore) *Handlers {
-	return NewHandlers(testChatID, s, tr, subs, slog.New(slog.DiscardHandler))
+	return NewHandlers(s, tr, subs, slog.New(slog.DiscardHandler))
 }
 
 // command runs a /command text update through the full HandleText path.

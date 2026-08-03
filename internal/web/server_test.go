@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -37,7 +38,7 @@ func testLogger() *slog.Logger {
 func testConfig() *config.Config {
 	return &config.Config{
 		TelegramToken:    "123456:test-token",
-		AllowedChatID:    42,
+		AllowedChatIDs:   []int64{42, -1001234567890},
 		ProwlarrURL:      "http://umbrel.local:9696",
 		ProwlarrAPIKey:   "prowlarr-key",
 		TransmissionURL:  "http://umbrel.local:9091",
@@ -76,7 +77,7 @@ func postForm(t *testing.T, s *Server, form url.Values) *httptest.ResponseRecord
 func validForm() url.Values {
 	return url.Values{
 		"telegram_token":    {"654321:new-token"},
-		"allowed_chat_id":   {"42"},
+		"allowed_chat_ids":  {"42,-1001234567890"},
 		"prowlarr_url":      {"http://umbrel.local:9696"},
 		"prowlarr_api_key":  {"new-prowlarr-key"},
 		"transmission_url":  {"http://umbrel.local:9091"},
@@ -108,21 +109,22 @@ func TestGetFormPrefilled(t *testing.T) {
 	body := rec.Body.String()
 
 	for _, want := range []string{
-		`value="42"`,               // allowed chat id
-		"http://umbrel.local:9696", // prowlarr url
-		"http://umbrel.local:9091", // transmission url
-		`value="tuser"`,            // transmission user (not a secret)
-		`value="45m"`,              // sub interval, trimmed
-		"Leave blank to keep",      // secret semantics hint
+		`value="42,-1001234567890"`, // allowed chat ids, comma-separated
+		"http://umbrel.local:9696",  // prowlarr url
+		"http://umbrel.local:9091",  // transmission url
+		`value="tuser"`,             // transmission user
+		`value="45m"`,               // sub interval, trimmed
+		// tokens are shown in full so they can be read and copied
+		`value="123456:test-token"`,
+		`value="prowlarr-key"`,
+		`value="tpass"`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("form does not contain %q", want)
 		}
 	}
-	for _, secret := range []string{"123456:test-token", "prowlarr-key", "tpass"} {
-		if strings.Contains(body, secret) {
-			t.Errorf("form echoes secret %q into HTML", secret)
-		}
+	if strings.Contains(body, `type="password"`) {
+		t.Error("form still masks a field; every value is meant to be readable")
 	}
 	if strings.Contains(body, "Not configured yet") {
 		t.Error("configured server shows the setup banner")
@@ -143,9 +145,6 @@ func TestGetFormUnconfigured(t *testing.T) {
 	}
 	if !strings.Contains(body, `value="20m"`) {
 		t.Error("unconfigured form does not prefill the default sub interval")
-	}
-	if strings.Contains(body, "Leave blank to keep") {
-		t.Error("unconfigured form shows keep-current hint with no secrets to keep")
 	}
 }
 
@@ -172,7 +171,7 @@ func TestPostValidSavesAndRestarts(t *testing.T) {
 	got := store.saved[0]
 	want := &config.Config{
 		TelegramToken:    "654321:new-token",
-		AllowedChatID:    42,
+		AllowedChatIDs:   []int64{42, -1001234567890},
 		ProwlarrURL:      "http://umbrel.local:9696",
 		ProwlarrAPIKey:   "new-prowlarr-key",
 		TransmissionURL:  "http://umbrel.local:9091",
@@ -181,17 +180,18 @@ func TestPostValidSavesAndRestarts(t *testing.T) {
 		DBPath:           "/data/bot.db", // preserved from the snapshot
 		SubInterval:      30 * time.Minute,
 	}
-	if *got != *want {
+	if !reflect.DeepEqual(got, want) {
 		t.Errorf("saved config mismatch:\n got %+v\nwant %+v", *got, *want)
 	}
 }
 
-func TestPostBlankSecretsKeepCurrent(t *testing.T) {
+func TestPostBlankOptionalSecretClearsIt(t *testing.T) {
+	// The form shows every value, so a submission is the whole configuration:
+	// a password the user emptied must actually be cleared, not restored from
+	// the snapshot behind their back.
 	s, store, restarts := newTestServer(testConfig())
 
 	form := validForm()
-	form.Set("telegram_token", "")
-	form.Set("prowlarr_api_key", "")
 	form.Set("transmission_pass", "")
 	rec := postForm(t, s, form)
 	if rec.Code != http.StatusOK {
@@ -200,16 +200,28 @@ func TestPostBlankSecretsKeepCurrent(t *testing.T) {
 	if *restarts != 1 || len(store.saved) != 1 {
 		t.Fatalf("restarts = %d, saves = %d, want 1 and 1", *restarts, len(store.saved))
 	}
+	if got := store.saved[0].TransmissionPass; got != "" {
+		t.Errorf("TransmissionPass = %q, want it cleared", got)
+	}
+}
 
-	got := store.saved[0]
-	if got.TelegramToken != "123456:test-token" {
-		t.Errorf("TelegramToken = %q, want current value kept", got.TelegramToken)
+func TestPostBlankRequiredSecretIsRejected(t *testing.T) {
+	// Same rule for required fields: blanking the token is an error, not a
+	// silent keep of the old one.
+	s, store, restarts := newTestServer(testConfig())
+
+	form := validForm()
+	form.Set("telegram_token", "")
+	rec := postForm(t, s, form)
+
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Errorf("POST / status = %d, want 422", rec.Code)
 	}
-	if got.ProwlarrAPIKey != "prowlarr-key" {
-		t.Errorf("ProwlarrAPIKey = %q, want current value kept", got.ProwlarrAPIKey)
+	if !strings.Contains(rec.Body.String(), "telegram_token") {
+		t.Error("error page does not mention telegram_token")
 	}
-	if got.TransmissionPass != "tpass" {
-		t.Errorf("TransmissionPass = %q, want current value kept", got.TransmissionPass)
+	if len(store.saved) != 0 || *restarts != 0 {
+		t.Errorf("saves = %d, restarts = %d, want 0 and 0", len(store.saved), *restarts)
 	}
 }
 
@@ -220,9 +232,10 @@ func TestPostInvalid(t *testing.T) {
 		value   string
 		mention string
 	}{
-		{"non-integer chat id", "allowed_chat_id", "abc", "allowed_chat_id"},
-		{"zero chat id", "allowed_chat_id", "0", "allowed_chat_id"},
-		{"blank chat id", "allowed_chat_id", "", "allowed_chat_id"},
+		{"non-integer chat id", "allowed_chat_ids", "abc", "allowed_chat_ids"},
+		{"non-integer among valid ones", "allowed_chat_ids", "42,abc", "allowed_chat_ids"},
+		{"zero chat id", "allowed_chat_ids", "0", "allowed_chat_ids"},
+		{"blank chat id", "allowed_chat_ids", "", "allowed_chat_ids"},
 		{"bad interval", "sub_interval", "soon", "sub_interval"},
 		{"negative interval", "sub_interval", "-5m", "sub_interval"},
 		{"bad prowlarr url", "prowlarr_url", "not a url", "prowlarr_url"},
@@ -253,7 +266,6 @@ func TestPostInvalid(t *testing.T) {
 }
 
 func TestPostUnconfiguredRequiresSecrets(t *testing.T) {
-	// with no current config there is nothing to keep: blank token is an error
 	s, store, restarts := newTestServer(nil)
 
 	form := validForm()
@@ -271,25 +283,39 @@ func TestPostUnconfiguredRequiresSecrets(t *testing.T) {
 	}
 }
 
-func TestPostInvalidDoesNotEchoSecrets(t *testing.T) {
+func TestPostInvalidKeepsEverythingTyped(t *testing.T) {
+	// A rejected save must not cost the user the token they just pasted.
 	s, _, _ := newTestServer(testConfig())
 
 	form := validForm()
-	form.Set("allowed_chat_id", "abc") // force a re-render
+	form.Set("allowed_chat_ids", "abc") // force a re-render
 	rec := postForm(t, s, form)
 
 	if rec.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("POST / status = %d, want 422", rec.Code)
 	}
 	body := rec.Body.String()
-	for _, secret := range []string{"654321:new-token", "new-prowlarr-key", "new-tpass"} {
-		if strings.Contains(body, secret) {
-			t.Errorf("re-rendered form echoes submitted secret %q", secret)
+	for _, typed := range []string{"654321:new-token", "new-prowlarr-key", "new-tpass", `value="30m"`} {
+		if !strings.Contains(body, typed) {
+			t.Errorf("re-rendered form dropped submitted value %q", typed)
 		}
 	}
-	// non-secret input must be kept so the user doesn't retype everything
-	if !strings.Contains(body, `value="30m"`) {
-		t.Error("re-rendered form dropped the submitted sub interval")
+}
+
+func TestPostChatIDListIsParsed(t *testing.T) {
+	s, store, _ := newTestServer(testConfig())
+
+	form := validForm()
+	form.Set("allowed_chat_ids", " 42 , -1001234567890 ,42, 7 ")
+	if rec := postForm(t, s, form); rec.Code != http.StatusOK {
+		t.Fatalf("POST / status = %d, want 200", rec.Code)
+	}
+	if len(store.saved) != 1 {
+		t.Fatalf("store.Save called %d times, want 1", len(store.saved))
+	}
+	want := []int64{42, -1001234567890, 7}
+	if got := store.saved[0].AllowedChatIDs; !reflect.DeepEqual(got, want) {
+		t.Errorf("AllowedChatIDs = %v, want %v", got, want)
 	}
 }
 

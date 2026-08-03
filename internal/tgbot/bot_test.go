@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -95,7 +96,7 @@ func (f *fakeTelegram) callsFor(method string) []fakeCall {
 func newOfflineBot(t *testing.T, srv *fakeTelegram) *Bot {
 	t.Helper()
 	h, _ := newTestHandlers(&fakeSearcher{}, &fakeTrans{})
-	b, err := New("123:testtoken", testChatID, h,
+	b, err := New("123:testtoken", []int64{testChatID}, h,
 		bot.WithSkipGetMe(), bot.WithServerURL(srv.URL))
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -131,7 +132,7 @@ func TestBotNotifyErrorSurfaces(t *testing.T) {
 	defer failing.Close()
 
 	h, _ := newTestHandlers(&fakeSearcher{}, &fakeTrans{})
-	b, err := New("123:testtoken", testChatID, h,
+	b, err := New("123:testtoken", []int64{testChatID}, h,
 		bot.WithSkipGetMe(), bot.WithServerURL(failing.URL))
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -139,6 +140,67 @@ func TestBotNotifyErrorSurfaces(t *testing.T) {
 
 	if err := b.Notify(context.Background(), "hi"); err == nil {
 		t.Fatal("Notify: want error when Telegram rejects the message, got nil")
+	}
+}
+
+func TestBotNotifyFansOutToEveryAllowedChat(t *testing.T) {
+	// Subscriptions belong to the install, not to whoever created them, so a
+	// completed download is announced in every allowed chat.
+	srv := newFakeTelegram(t)
+	h, _ := newTestHandlers(&fakeSearcher{}, &fakeTrans{})
+	b, err := New("123:testtoken", []int64{42, -1001234567890}, h,
+		bot.WithSkipGetMe(), bot.WithServerURL(srv.URL))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	if err := b.Notify(context.Background(), "hi"); err != nil {
+		t.Fatalf("Notify: %v", err)
+	}
+
+	sent := srv.callsFor("sendMessage")
+	if len(sent) != 2 {
+		t.Fatalf("sendMessage calls = %d, want 2", len(sent))
+	}
+	got := []string{sent[0].form["chat_id"], sent[1].form["chat_id"]}
+	if want := []string{"42", "-1001234567890"}; !slices.Equal(got, want) {
+		t.Errorf("chat_ids = %v, want %v", got, want)
+	}
+}
+
+func TestBotNotifyPartialFailureStillDelivers(t *testing.T) {
+	// One unreachable chat — bot blocked, group deleted — must not silence the
+	// others, and must not be reported as a failed notification.
+	var n int
+	var mu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		n++
+		first := n == 1
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if first && strings.HasSuffix(r.URL.Path, "/sendMessage") {
+			w.Write([]byte(`{"ok":false,"error_code":403,"description":"Forbidden: bot was blocked by the user"}`))
+			return
+		}
+		w.Write([]byte(`{"ok":true,"result":{"message_id":1,"chat":{"id":7}}}`))
+	}))
+	defer srv.Close()
+
+	h, _ := newTestHandlers(&fakeSearcher{}, &fakeTrans{})
+	b, err := New("123:testtoken", []int64{42, 7}, h,
+		bot.WithSkipGetMe(), bot.WithServerURL(srv.URL))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	if err := b.Notify(context.Background(), "hi"); err != nil {
+		t.Errorf("Notify: want nil when one of two chats succeeded, got %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if n != 2 {
+		t.Errorf("sendMessage attempts = %d, want 2 (a failed chat must not stop the rest)", n)
 	}
 }
 

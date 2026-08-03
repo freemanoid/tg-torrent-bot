@@ -90,26 +90,27 @@ func commandMenu() []models.BotCommand {
 	}
 }
 
-// handleCommand routes a "/command args" message to its handler.
-func (h *Handlers) handleCommand(ctx context.Context, api telegramAPI, text string) {
+// handleCommand routes a "/command args" message to its handler. chatID is
+// the chat the command came from, and where its answer goes.
+func (h *Handlers) handleCommand(ctx context.Context, api telegramAPI, chatID int64, text string) {
 	cmd, args := splitCommand(text)
 	switch cmd {
 	case "/sub":
-		h.cmdSub(ctx, api, args)
+		h.cmdSub(ctx, api, chatID, args)
 	case "/subs":
-		h.cmdSubs(ctx, api)
+		h.cmdSubs(ctx, api, chatID)
 	case "/unsub":
-		h.cmdUnsub(ctx, api, args)
+		h.cmdUnsub(ctx, api, chatID, args)
 	case "/pause":
-		h.cmdPause(ctx, api, args)
+		h.cmdPause(ctx, api, chatID, args)
 	case "/test":
-		h.cmdTest(ctx, api, args)
+		h.cmdTest(ctx, api, chatID, args)
 	case "/status":
-		h.cmdStatus(ctx, api)
+		h.cmdStatus(ctx, api, chatID)
 	case "/help", "/start":
-		h.reply(ctx, api, helpText)
+		h.reply(ctx, api, chatID, helpText)
 	default:
-		h.reply(ctx, api, "Unknown command. Send plain text to search, or see /help.")
+		h.reply(ctx, api, chatID, "Unknown command. Send plain text to search, or see /help.")
 	}
 }
 
@@ -130,16 +131,16 @@ func splitCommand(text string) (cmd, args string) {
 
 // cmdSub creates a subscription from "<query> | <filters>". Only the first
 // "|" separates query from filters, so regex filters may contain "|".
-func (h *Handlers) cmdSub(ctx context.Context, api telegramAPI, args string) {
+func (h *Handlers) cmdSub(ctx context.Context, api telegramAPI, chatID int64, args string) {
 	queryPart, filterPart, _ := strings.Cut(args, "|")
 	query := strings.TrimSpace(queryPart)
 	if query == "" {
-		h.reply(ctx, api, subUsage)
+		h.reply(ctx, api, chatID, subUsage)
 		return
 	}
 	f, err := filter.Parse(filterPart)
 	if err != nil {
-		h.reply(ctx, api, fmt.Sprintf("Bad filter: %v\n\n%s", err, subUsage))
+		h.reply(ctx, api, chatID, fmt.Sprintf("Bad filter: %v\n\n%s", err, subUsage))
 		return
 	}
 
@@ -151,7 +152,7 @@ func (h *Handlers) cmdSub(ctx context.Context, api telegramAPI, args string) {
 		MaxSizeMB: f.MaxSizeMB,
 	})
 	if err != nil {
-		h.reply(ctx, api, fmt.Sprintf("Failed to save subscription: %v", err))
+		h.reply(ctx, api, chatID, fmt.Sprintf("Failed to save subscription: %v", err))
 		return
 	}
 
@@ -159,18 +160,18 @@ func (h *Handlers) cmdSub(ctx context.Context, api telegramAPI, args string) {
 	if fs := f.String(); fs != "" {
 		msg += "\nFilters: " + fs
 	}
-	h.reply(ctx, api, msg)
+	h.reply(ctx, api, chatID, msg)
 }
 
 // cmdSubs lists every subscription with filters, state, and stats.
-func (h *Handlers) cmdSubs(ctx context.Context, api telegramAPI) {
+func (h *Handlers) cmdSubs(ctx context.Context, api telegramAPI, chatID int64) {
 	subs, err := h.subs.ListSubscriptions(ctx)
 	if err != nil {
-		h.reply(ctx, api, fmt.Sprintf("Failed to list subscriptions: %v", err))
+		h.reply(ctx, api, chatID, fmt.Sprintf("Failed to list subscriptions: %v", err))
 		return
 	}
 	if len(subs) == 0 {
-		h.reply(ctx, api, "No subscriptions yet. Create one with /sub <query> | <filters>.")
+		h.reply(ctx, api, chatID, "No subscriptions yet. Create one with /sub <query> | <filters>.")
 		return
 	}
 
@@ -179,7 +180,7 @@ func (h *Handlers) cmdSubs(ctx context.Context, api telegramAPI) {
 	for _, sub := range subs {
 		b.WriteString("\n" + subscriptionLine(sub))
 	}
-	h.reply(ctx, api, b.String())
+	h.reply(ctx, api, chatID, b.String())
 }
 
 // subscriptionLine renders one /subs entry.
@@ -201,75 +202,75 @@ func subscriptionLine(sub store.Subscription) string {
 }
 
 // cmdUnsub deletes the subscription with the given id.
-func (h *Handlers) cmdUnsub(ctx context.Context, api telegramAPI, args string) {
+func (h *Handlers) cmdUnsub(ctx context.Context, api telegramAPI, chatID int64, args string) {
 	id, ok := parseID(args)
 	if !ok {
-		h.reply(ctx, api, "Usage: /unsub <id> — see /subs for ids.")
+		h.reply(ctx, api, chatID, "Usage: /unsub <id> — see /subs for ids.")
 		return
 	}
 	switch err := h.subs.DeleteSubscription(ctx, id); {
 	case errors.Is(err, store.ErrNotFound):
-		h.reply(ctx, api, fmt.Sprintf("Subscription #%d not found — see /subs.", id))
+		h.reply(ctx, api, chatID, fmt.Sprintf("Subscription #%d not found — see /subs.", id))
 	case err != nil:
-		h.reply(ctx, api, fmt.Sprintf("Failed to remove subscription #%d: %v", id, err))
+		h.reply(ctx, api, chatID, fmt.Sprintf("Failed to remove subscription #%d: %v", id, err))
 	default:
-		h.reply(ctx, api, fmt.Sprintf("🗑 Removed subscription #%d.", id))
+		h.reply(ctx, api, chatID, fmt.Sprintf("🗑 Removed subscription #%d.", id))
 	}
 }
 
 // cmdPause toggles a subscription between paused and active.
-func (h *Handlers) cmdPause(ctx context.Context, api telegramAPI, args string) {
+func (h *Handlers) cmdPause(ctx context.Context, api telegramAPI, chatID int64, args string) {
 	id, ok := parseID(args)
 	if !ok {
-		h.reply(ctx, api, "Usage: /pause <id> — see /subs for ids.")
+		h.reply(ctx, api, chatID, "Usage: /pause <id> — see /subs for ids.")
 		return
 	}
 	sub, err := h.subs.GetSubscription(ctx, id)
 	if errors.Is(err, store.ErrNotFound) {
-		h.reply(ctx, api, fmt.Sprintf("Subscription #%d not found — see /subs.", id))
+		h.reply(ctx, api, chatID, fmt.Sprintf("Subscription #%d not found — see /subs.", id))
 		return
 	}
 	if err == nil {
 		err = h.subs.SetSubscriptionPaused(ctx, id, !sub.Paused)
 	}
 	if err != nil {
-		h.reply(ctx, api, fmt.Sprintf("Failed to update subscription #%d: %v", id, err))
+		h.reply(ctx, api, chatID, fmt.Sprintf("Failed to update subscription #%d: %v", id, err))
 		return
 	}
 	if sub.Paused {
-		h.reply(ctx, api, fmt.Sprintf("▶️ Resumed subscription #%d «%s».", id, sub.Query))
+		h.reply(ctx, api, chatID, fmt.Sprintf("▶️ Resumed subscription #%d «%s».", id, sub.Query))
 	} else {
-		h.reply(ctx, api, fmt.Sprintf("⏸ Paused subscription #%d «%s».", id, sub.Query))
+		h.reply(ctx, api, chatID, fmt.Sprintf("⏸ Paused subscription #%d «%s».", id, sub.Query))
 	}
 }
 
 // cmdTest dry-runs a subscription: it searches and filters like the engine
 // would, but downloads nothing and leaves the seen-table untouched (the
 // SubscriptionStore interface has no seen methods at all).
-func (h *Handlers) cmdTest(ctx context.Context, api telegramAPI, args string) {
+func (h *Handlers) cmdTest(ctx context.Context, api telegramAPI, chatID int64, args string) {
 	id, ok := parseID(args)
 	if !ok {
-		h.reply(ctx, api, "Usage: /test <id> — see /subs for ids.")
+		h.reply(ctx, api, chatID, "Usage: /test <id> — see /subs for ids.")
 		return
 	}
 	sub, err := h.subs.GetSubscription(ctx, id)
 	if errors.Is(err, store.ErrNotFound) {
-		h.reply(ctx, api, fmt.Sprintf("Subscription #%d not found — see /subs.", id))
+		h.reply(ctx, api, chatID, fmt.Sprintf("Subscription #%d not found — see /subs.", id))
 		return
 	}
 	if err != nil {
-		h.reply(ctx, api, fmt.Sprintf("Failed to load subscription #%d: %v", id, err))
+		h.reply(ctx, api, chatID, fmt.Sprintf("Failed to load subscription #%d: %v", id, err))
 		return
 	}
 
 	// Same slow search as a plain query, so the same ack — but left standing
 	// rather than edited: the dry-run answer below is a list that h.reply may
 	// have to split across several messages.
-	h.ackSearching(ctx, api, sub.Query)
+	h.ackSearching(ctx, api, chatID, sub.Query)
 
 	releases, err := h.searcher.Search(ctx, sub.Query)
 	if err != nil {
-		h.reply(ctx, api, "Search failed: "+err.Error())
+		h.reply(ctx, api, chatID, "Search failed: "+err.Error())
 		return
 	}
 
@@ -294,24 +295,24 @@ func (h *Handlers) cmdTest(ctx context.Context, api telegramAPI, args string) {
 	if len(matched) > 0 {
 		b.WriteString("\n\nNothing was downloaded.")
 	}
-	h.reply(ctx, api, b.String())
+	h.reply(ctx, api, chatID, b.String())
 }
 
 // cmdStatus lists the bot's active downloads with live Transmission progress,
 // followed by what it recently finished.
-func (h *Handlers) cmdStatus(ctx context.Context, api telegramAPI) {
+func (h *Handlers) cmdStatus(ctx context.Context, api telegramAPI, chatID int64) {
 	active, err := h.subs.ActiveDownloads(ctx)
 	if err != nil {
-		h.reply(ctx, api, fmt.Sprintf("Failed to list downloads: %v", err))
+		h.reply(ctx, api, chatID, fmt.Sprintf("Failed to list downloads: %v", err))
 		return
 	}
 	completed, err := h.subs.RecentCompleted(ctx, maxCompletedLines)
 	if err != nil {
-		h.reply(ctx, api, fmt.Sprintf("Failed to list downloads: %v", err))
+		h.reply(ctx, api, chatID, fmt.Sprintf("Failed to list downloads: %v", err))
 		return
 	}
 	if len(active) == 0 && len(completed) == 0 {
-		h.reply(ctx, api, "No downloads yet.")
+		h.reply(ctx, api, chatID, "No downloads yet.")
 		return
 	}
 
@@ -322,7 +323,7 @@ func (h *Handlers) cmdStatus(ctx context.Context, api telegramAPI) {
 	if len(completed) > 0 {
 		sections = append(sections, completedSection(completed))
 	}
-	h.reply(ctx, api, strings.Join(sections, "\n\n"))
+	h.reply(ctx, api, chatID, strings.Join(sections, "\n\n"))
 }
 
 // activeSection renders the running downloads with live Transmission progress.

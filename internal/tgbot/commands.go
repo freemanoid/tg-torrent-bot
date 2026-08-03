@@ -61,7 +61,9 @@ const subUsage = "Usage: /sub <query> | <filters>\n" +
 	"Add the backlog filter to also grab what is already on the tracker."
 
 const helpText = `🔍 Send any text to search for torrents; tap a result to download it.
-Tap 🔔 under the results to subscribe to that exact search.
+Prefix a word with "-" to exclude it: "формула 1 2026 2160p -AV1" drops every
+AV1 release from the results.
+Tap 🔔 under the results to subscribe to that exact search, exclusions included.
 Tap ℹ️<number> to see that release in full first — every detail line
 untruncated, what the tracker says about it, and the list of files inside.
 A result the bot already grabbed is marked: ⬇️ downloading · ✅ downloaded.

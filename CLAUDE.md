@@ -297,6 +297,13 @@ Tests in all three packages.
 plus `String` so the `Parse ⇄ String` round-trip test still holds. Filters are
 persisted as raw token strings, so old subscriptions must keep parsing.
 
+**Change what a search query may say** — `internal/tgbot/query.go`:
+`parseSearchQuery` splits a typed search on whitespace into the words Prowlarr
+is asked for and the `-token` exclusions applied to the answer here.
+Exclusion tokens go through `filter.Parse` one at a time so the filter package
+stays the only definition of what a pattern is; `filter.Parse`'s own
+comma-splitting is why they cannot be handed to it in bulk.
+
 **Change search results / keyboards** — `internal/tgbot/search.go` (flow),
 `format.go` (`resultsMessage` → `releaseBlock` for the text, `buttonLabel` for
 the keyboard, callback packing). What a release *says about itself* is parsed
@@ -325,6 +332,18 @@ TTL.
   cost a search that took minutes. Only what the bot grabbed is matched (info
   hash, then exact title), so a torrent added directly in Transmission is
   unmarked by design.
+- **Search exclusions are stripped before Prowlarr and applied here.** A
+  `-token` never reaches the API: Prowlarr fans one query out to every indexer
+  and each tracker reads query syntax differently, so passing it through would
+  make the same search mean different things per indexer — and an indexer that
+  takes `-AV1` as a required literal would return nothing at all. Filtering
+  happens *before* `cache.Put`, so the page numbering, the `dl:`/`if:` indices
+  and `pageMarks` all count the releases the message actually shows.
+- **`cachedSearch.Query` is the whole parsed query, not a string.** `Raw` is
+  what every message echoes (the user typed it), `Terms` is what was searched,
+  and `Exclude` is what the 🔔 button copies onto the subscription — a
+  subscription built from `Raw` would search for the literal "-AV1", one built
+  from `Terms` alone would auto-grab what the user was avoiding.
 - **Telegram messages are chunked at 4096 chars**; unbounded replies (`/subs`,
   `/status`) would otherwise silently fail to send.
 - **The details view fetches the .torrent and throws it away.** `ℹ️` parses the

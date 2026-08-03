@@ -83,24 +83,45 @@ func (h *Handlers) HandleText(ctx context.Context, api telegramAPI, update *mode
 		return
 	}
 
-	ack := h.ackSearching(ctx, api, chatID, query)
+	q, err := parseSearchQuery(query)
+	if err != nil {
+		h.reply(ctx, api, chatID, fmt.Sprintf("Bad search: %v\n\n%s", err, searchUsage))
+		return
+	}
 
-	releases, err := h.searcher.Search(ctx, query)
+	ack := h.ackSearching(ctx, api, chatID, q.Raw)
+
+	releases, err := h.searcher.Search(ctx, q.Terms)
 	if err != nil {
 		h.answer(ctx, api, chatID, ack, "Search failed: "+err.Error(), nil)
 		return
 	}
 	if len(releases) == 0 {
-		h.answer(ctx, api, chatID, ack, fmt.Sprintf("No results for «%s».", query), nil)
+		h.answer(ctx, api, chatID, ack, fmt.Sprintf("No results for «%s».", q.Raw), nil)
+		return
+	}
+	// Excluding happens before the results are cached, so the page numbering,
+	// the download indices and the ℹ️ buttons all count the same releases the
+	// message shows.
+	found := len(releases)
+	releases = q.keep(releases)
+	if len(releases) == 0 {
+		h.answer(ctx, api, chatID, ack, fmt.Sprintf(
+			"No results for «%s» — all %d match(es) were excluded by %s.",
+			q.Raw, found, q.excludeList()), nil)
 		return
 	}
 
-	id := h.cache.Put(cachedSearch{Query: query, Releases: releases})
+	id := h.cache.Put(cachedSearch{Query: q, Releases: releases})
 	marks := h.pageMarks(ctx, releases, 0)
 	h.answer(ctx, api, chatID, ack,
-		resultsMessage(query, releases, 0, marks),
+		resultsMessage(q.Raw, releases, 0, marks),
 		resultsKeyboard(id, releases, 0, marks))
 }
+
+// searchUsage explains the one piece of search syntax the bot reads itself.
+const searchUsage = "Send words to search for; prefix a word with \"-\" to " +
+	"exclude it, e.g.\n\nформула 1 2026 2160p -AV1"
 
 // pageMarks reports which releases on the given page the bot already grabbed,
 // as a marker per release index.
@@ -264,25 +285,32 @@ func (h *Handlers) HandleCallback(ctx context.Context, api telegramAPI, update *
 }
 
 // subscribeToSearch turns the search behind the 🔔 button into a subscription:
-// the query exactly as it was typed, no filters, and a cutoff of now.
+// the same words, the same exclusions, and a cutoff of now.
 //
-// The query is taken verbatim on purpose. Guessing which words name the series
-// and which name one episode is the kind of cleverness that fails silently on
-// whatever the guess did not anticipate; the user already knows which query
-// they meant, and can send /sub by hand to say something more precise.
+// The words are taken verbatim on purpose. Guessing which of them name the
+// series and which name one episode is the kind of cleverness that fails
+// silently on whatever the guess did not anticipate; the user already knows
+// which query they meant, and can send /sub by hand to say something more
+// precise. The exclusions come along because the subscription is meant to
+// repeat the search that was just run — dropping them would auto-grab exactly
+// what the user was steering away from.
 func (h *Handlers) subscribeToSearch(ctx context.Context, api telegramAPI, chatID int64, entry cachedSearch) {
 	sub, err := h.subs.CreateSubscription(ctx, store.Subscription{
-		Query:    entry.Query,
+		Query:    entry.Query.Terms,
+		Exclude:  entry.Query.Exclude,
 		CutoffAt: time.Now().UTC(),
 	})
 	if err != nil {
 		h.reply(ctx, api, chatID, fmt.Sprintf("Failed to save subscription: %v", err))
 		return
 	}
-	h.reply(ctx, api, chatID, fmt.Sprintf(
-		"🔔 Subscribed #%d: «%s»\nNew releases from now on will download by themselves. "+
-			"Anything already on the tracker is left alone — tap ⬇️ for those.",
-		sub.ID, sub.Query))
+	msg := fmt.Sprintf("🔔 Subscribed #%d: «%s»", sub.ID, sub.Query)
+	if list := entry.Query.excludeList(); list != "" {
+		msg += "\nFilters: " + list
+	}
+	msg += "\nNew releases from now on will download by themselves. " +
+		"Anything already on the tracker is left alone — tap ⬇️ for those."
+	h.reply(ctx, api, chatID, msg)
 }
 
 // offerReject swaps a grab notification's keyboard for a confirmation. Only
@@ -392,7 +420,7 @@ func rejectConfirmKeyboard(hash string) *models.InlineKeyboardMarkup {
 func (h *Handlers) flipPage(ctx context.Context, api telegramAPI, cb *models.CallbackQuery, chatID int64, searchID string, entry cachedSearch, page int) {
 	page = clampPage(len(entry.Releases), page)
 	marks := h.pageMarks(ctx, entry.Releases, page)
-	text := resultsMessage(entry.Query, entry.Releases, page, marks)
+	text := resultsMessage(entry.Query.Raw, entry.Releases, page, marks)
 	kb := resultsKeyboard(searchID, entry.Releases, page, marks)
 
 	if msg := cb.Message.Message; msg != nil {

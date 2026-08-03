@@ -11,8 +11,10 @@ It does two things:
    asks Prowlarr (TrackerA+TrackerB) and lists the results sorted by seeders,
    each with its full title, swarm health, and whatever the release title says
    about the media inside (resolution, source, codecs, audio tracks,
-   subtitles, container). One tap sends the torrent to Transmission. When the
-   download finishes, the bot sends a one-time "✅ finished" notification.
+   subtitles, container). Prefix a word with `-` to exclude it
+   (`формула 1 2026 2160p -AV1`). One tap sends the torrent to Transmission.
+   When the download finishes, the bot sends a one-time "✅ finished"
+   notification.
 2. **Subscriptions** — tap 🔔 under any search results to watch that exact
    query, or write one out with `/sub <query> | <filters>` (e.g.
    `/sub space show 2026 | rus, 1080p, x265, -720p`). A ticker re-runs the
@@ -175,8 +177,8 @@ setup mode and waits for the form.
 
 | Command | What it does |
 |---|---|
-| *any plain text* | Search Prowlarr, show tappable results sorted by seeders |
-| 🔔 *(button)* | Subscribe to the search you just ran, no filters, new releases only |
+| *any plain text* | Search Prowlarr, show tappable results sorted by seeders; `-word` excludes |
+| 🔔 *(button)* | Subscribe to the search you just ran, its exclusions kept, new releases only |
 | 🗑 *(button)* | Reject a subscription grab: remove it from Transmission and delete its files |
 | `/sub <query> \| <filters>` | Create a subscription (filters optional) |
 | `/subs` | List subscriptions with filters, paused state, grab count, cutoff date |
@@ -190,6 +192,22 @@ setup mode and waits for the form.
 Searches return the top 50 releases (5 per keyboard page), sorted by
 seeders. Subscriptions grab at most 10 new matches per tick; the rest are
 picked up on the following ticks.
+
+### Excluding from a search
+
+A search word starting with `-` excludes instead of searching: `-AV1` drops
+every result whose title contains AV1, and `-/av1|vp9/` does the same with a
+regex — the `/sub` exclusion tokens, applied to one search. Only a leading `-`
+counts, so `WEB-DL` stays an ordinary word, and the exclusions never reach
+Prowlarr: each indexer reads query syntax its own way, so the bot filters the
+results itself and the meaning stays the same whichever tracker answered.
+
+```
+формула 1 2026 2160p 10 rus -AV1
+```
+
+Size bounds (`>1gb`, `<30gb`) are subscription-only and stay ordinary search
+words here.
 
 Each result is listed like this:
 

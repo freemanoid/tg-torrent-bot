@@ -11,7 +11,7 @@ func TestSearchCachePutGet(t *testing.T) {
 	c := newSearchCache(time.Hour)
 	releases := []prowlarr.Release{{Title: "first"}, {Title: "second"}}
 
-	id := c.Put(cachedSearch{Query: "space show", Releases: releases})
+	id := c.Put(cachedSearch{Query: searchFor("space show"), Releases: releases})
 	if id == "" {
 		t.Fatal("Put returned empty id")
 	}
@@ -20,8 +20,8 @@ func TestSearchCachePutGet(t *testing.T) {
 	if !ok {
 		t.Fatalf("Get(%q) = miss, want hit", id)
 	}
-	if got.Query != "space show" {
-		t.Errorf("Query = %q, want %q", got.Query, "space show")
+	if got.Query.Raw != "space show" {
+		t.Errorf("Query = %q, want %q", got.Query.Raw, "space show")
 	}
 	if len(got.Releases) != 2 || got.Releases[0].Title != "first" {
 		t.Errorf("Releases = %+v, want the two cached releases", got.Releases)
@@ -40,7 +40,7 @@ func TestSearchCacheTTLExpiry(t *testing.T) {
 	now := time.Now()
 	c.now = func() time.Time { return now }
 
-	id := c.Put(cachedSearch{Query: "q"})
+	id := c.Put(cachedSearch{Query: searchFor("q")})
 
 	now = now.Add(59 * time.Minute)
 	if _, ok := c.Get(id); !ok {
@@ -58,9 +58,9 @@ func TestSearchCachePutPurgesExpired(t *testing.T) {
 	now := time.Now()
 	c.now = func() time.Time { return now }
 
-	old := c.Put(cachedSearch{Query: "old"})
+	old := c.Put(cachedSearch{Query: searchFor("old")})
 	now = now.Add(2 * time.Hour)
-	c.Put(cachedSearch{Query: "new"})
+	c.Put(cachedSearch{Query: searchFor("new")})
 
 	c.mu.Lock()
 	_, stillThere := c.entries[old]
@@ -78,7 +78,7 @@ func TestSearchCacheDistinctIDs(t *testing.T) {
 	c := newSearchCache(time.Hour)
 	seen := make(map[string]bool)
 	for range 100 {
-		id := c.Put(cachedSearch{Query: "q"})
+		id := c.Put(cachedSearch{Query: searchFor("q")})
 		if seen[id] {
 			t.Fatalf("duplicate id %q", id)
 		}

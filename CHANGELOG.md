@@ -5,6 +5,17 @@ the binary: after an update the bot posts the entry matching the version it is
 running, so keep entries short, plain, and headed `## v<version>` — the same
 version the git tag carries.
 
+## v1.10.0
+
+- A search word starting with `-` now excludes: send
+  `формула 1 2026 2160p -AV1` and results with AV1 in the title are dropped.
+  Regex works too (`-/av1|vp9/`). Until now those words were passed straight to
+  the trackers, which each read them their own way — usually as no filter at
+  all. The bot filters the results itself now, so it works the same whichever
+  tracker answered.
+- The 🔔 button keeps those exclusions: subscribing to a search with `-AV1`
+  gives you a subscription that will not grab AV1 either.
+
 ## v1.9.0
 
 - Subscribing is now one tap: under any search results there is a 🔔 button

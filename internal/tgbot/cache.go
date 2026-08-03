@@ -14,8 +14,10 @@ import (
 const cacheTTL = time.Hour
 
 // cachedSearch is one search's results, kept for inline-keyboard callbacks.
+// Releases are what the query's exclusions already left standing, so every
+// index the keyboard carries points at a release the user can actually see.
 type cachedSearch struct {
-	Query    string
+	Query    searchQuery
 	Releases []prowlarr.Release
 }
 

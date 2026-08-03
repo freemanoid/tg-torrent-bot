@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -209,6 +210,16 @@ func nReleases(n int) []prowlarr.Release {
 		}
 	}
 	return releases
+}
+
+// searchFor is parseSearchQuery for tests that need a cached search directly;
+// every query they pass is a literal the parser accepts.
+func searchFor(raw string) searchQuery {
+	q, err := parseSearchQuery(raw)
+	if err != nil {
+		panic(err)
+	}
+	return q
 }
 
 func keyboardOf(t *testing.T, markup models.ReplyMarkup) *models.InlineKeyboardMarkup {
@@ -523,6 +534,129 @@ func TestHandleTextNoResults(t *testing.T) {
 	}
 }
 
+// --- exclusions in a search query ---
+
+func TestHandleTextExcludesMatchingReleases(t *testing.T) {
+	s := &fakeSearcher{releases: []prowlarr.Release{
+		{GUID: "a", Title: "Формула 1. S2026. Этап 10. [WEB-DL, AV1, 2160p] RUS", Seeders: 29},
+		{GUID: "b", Title: "Формула 1. S2026. Этап 10. [WEB-DL, H.265, 2160p] RUS", Seeders: 12},
+	}}
+	h, _ := newTestHandlers(s, &fakeTrans{})
+	tg := &fakeTG{}
+
+	h.HandleText(context.Background(), tg, textUpdate("формула 1 2026 2160p 10 rus -AV1"))
+
+	// The exclusion is the bot's own business: every indexer reads query syntax
+	// differently, so it must not ride along to Prowlarr.
+	if got := s.queries; len(got) != 1 || got[0] != "формула 1 2026 2160p 10 rus" {
+		t.Fatalf("searched queries = %q, want the exclusion stripped", got)
+	}
+	msg := tg.lastEditedText(t)
+	if strings.Contains(msg, "AV1,") {
+		t.Errorf("results %q still contain the excluded release", msg)
+	}
+	if !strings.Contains(msg, "H.265") {
+		t.Errorf("results %q dropped the release that should have survived", msg)
+	}
+	// The header echoes what the user typed, exclusions included, and counts
+	// only what survived them.
+	if !strings.Contains(msg, "-AV1") || !strings.Contains(msg, "1 result") {
+		t.Errorf("header of %q must show the query as typed and 1 result", msg)
+	}
+}
+
+func TestHandleTextEverythingExcluded(t *testing.T) {
+	s := &fakeSearcher{releases: []prowlarr.Release{
+		{GUID: "a", Title: "Формула 1. S2026. Этап 10. [WEB-DL, AV1, 2160p] RUS"},
+	}}
+	h, _ := newTestHandlers(s, &fakeTrans{})
+	tg := &fakeTG{}
+
+	h.HandleText(context.Background(), tg, textUpdate("формула 1 2026 -AV1"))
+
+	// "No results" alone would be a lie: the search worked, the exclusion did
+	// the removing, and the user has to be able to tell those two apart.
+	got := tg.lastEditedText(t)
+	if !strings.Contains(got, "1") || !strings.Contains(got, "excluded") || !strings.Contains(got, "-AV1") {
+		t.Errorf("reply %q must say how many results the exclusions removed", got)
+	}
+}
+
+func TestHandleTextRejectsUnusableQuery(t *testing.T) {
+	tests := []struct {
+		name string
+		text string
+		want string
+	}{
+		{name: "only exclusions", text: "-AV1 -720p", want: "at least one word"},
+		{name: "bare minus", text: "space show -", want: "empty exclude"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &fakeSearcher{releases: nReleases(3)}
+			h, _ := newTestHandlers(s, &fakeTrans{})
+			tg := &fakeTG{}
+
+			h.HandleText(context.Background(), tg, textUpdate(tt.text))
+
+			if len(s.queries) != 0 {
+				t.Errorf("searched %q, want no search at all", s.queries)
+			}
+			if got := tg.lastSentText(t); !strings.Contains(got, tt.want) {
+				t.Errorf("reply %q must explain the problem (%q)", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSubscribeButtonKeepsTheExclusions(t *testing.T) {
+	s := &fakeSearcher{releases: []prowlarr.Release{
+		{GUID: "b", Title: "Формула 1. S2026. Этап 10. [WEB-DL, H.265, 2160p] RUS"},
+	}}
+	h, subs := newTestHandlers(s, &fakeTrans{})
+	tg := &fakeTG{}
+
+	h.HandleText(context.Background(), tg, textUpdate("формула 1 2026 -AV1"))
+	id := searchIDFrom(t, tg.edited[0].ReplyMarkup)
+	h.HandleCallback(context.Background(), tg, callbackUpdateFrom(testChatID, encodeCallback(cbSub, id, 0)))
+
+	if len(subs.created) != 1 {
+		t.Fatalf("created %d subscriptions, want 1", len(subs.created))
+	}
+	got := subs.created[0]
+	// A subscription that kept the words but dropped the exclusions would grab
+	// exactly what the user was steering away from.
+	if got.Query != "формула 1 2026" {
+		t.Errorf("subscription query = %q, want the search words without the exclusion", got.Query)
+	}
+	if !slices.Equal(got.Exclude, []string{"AV1"}) {
+		t.Errorf("subscription excludes = %v, want [AV1]", got.Exclude)
+	}
+	if text := tg.lastSentText(t); !strings.Contains(text, "AV1") {
+		t.Errorf("confirmation %q must show the filters it carried over", text)
+	}
+}
+
+// searchIDFrom digs the cached-search ID out of a results keyboard, so a test
+// can act on the search a real user would be looking at.
+func searchIDFrom(t *testing.T, markup models.ReplyMarkup) string {
+	t.Helper()
+	kb := keyboardOf(t, markup)
+	for _, row := range kb.InlineKeyboard {
+		for _, btn := range row {
+			if btn.CallbackData == "" {
+				continue
+			}
+			_, ref, _, err := decodeCallback(btn.CallbackData)
+			if err == nil {
+				return ref
+			}
+		}
+	}
+	t.Fatal("no callback button in the keyboard")
+	return ""
+}
+
 func TestHandleTextAckSendFailureStillDelivers(t *testing.T) {
 	// The ack is a courtesy: losing it must not cost the user their results.
 	s := &fakeSearcher{releases: nReleases(2*perPage + 5)}
@@ -603,7 +737,7 @@ func TestDownloadCallbackFetchesAndAdds(t *testing.T) {
 	h, subs := newTestHandlers(s, tr)
 	tg := &fakeTG{}
 
-	id := h.cache.Put(cachedSearch{Query: "q", Releases: []prowlarr.Release{{
+	id := h.cache.Put(cachedSearch{Query: searchFor("q"), Releases: []prowlarr.Release{{
 		Title:       "Космос [1080p, Rus]",
 		DownloadURL: "http://prowlarr/dl/1",
 	}}})
@@ -637,7 +771,7 @@ func TestDownloadCallbackMagnetOnly(t *testing.T) {
 	h, _ := newTestHandlers(s, tr)
 	tg := &fakeTG{}
 
-	id := h.cache.Put(cachedSearch{Query: "q", Releases: []prowlarr.Release{{
+	id := h.cache.Put(cachedSearch{Query: searchFor("q"), Releases: []prowlarr.Release{{
 		Title:     "Magnet Release",
 		MagnetURL: "magnet:?xt=urn:btih:def456",
 	}}})
@@ -677,7 +811,7 @@ func TestDownloadCallbackFetchError(t *testing.T) {
 	h, subs := newTestHandlers(s, tr)
 	tg := &fakeTG{}
 
-	id := h.cache.Put(cachedSearch{Query: "q", Releases: []prowlarr.Release{{
+	id := h.cache.Put(cachedSearch{Query: searchFor("q"), Releases: []prowlarr.Release{{
 		Title: "T", DownloadURL: "http://prowlarr/dl/1",
 	}}})
 
@@ -697,7 +831,7 @@ func TestDownloadCallbackAddError(t *testing.T) {
 	h, subs := newTestHandlers(s, tr)
 	tg := &fakeTG{}
 
-	id := h.cache.Put(cachedSearch{Query: "q", Releases: []prowlarr.Release{{
+	id := h.cache.Put(cachedSearch{Query: searchFor("q"), Releases: []prowlarr.Release{{
 		Title: "T", DownloadURL: "http://prowlarr/dl/1",
 	}}})
 
@@ -720,7 +854,7 @@ func TestDownloadCallbackRecorderFailureStillConfirms(t *testing.T) {
 	subs.addDLErr = errors.New("disk full")
 	tg := &fakeTG{}
 
-	id := h.cache.Put(cachedSearch{Query: "q", Releases: []prowlarr.Release{{
+	id := h.cache.Put(cachedSearch{Query: searchFor("q"), Releases: []prowlarr.Release{{
 		Title: "T", DownloadURL: "http://prowlarr/dl/1",
 	}}})
 
@@ -742,7 +876,7 @@ func TestDownloadCallbackNoLink(t *testing.T) {
 	h, _ := newTestHandlers(&fakeSearcher{}, &fakeTrans{})
 	tg := &fakeTG{}
 
-	id := h.cache.Put(cachedSearch{Query: "q", Releases: []prowlarr.Release{{Title: "T"}}})
+	id := h.cache.Put(cachedSearch{Query: searchFor("q"), Releases: []prowlarr.Release{{Title: "T"}}})
 
 	h.HandleCallback(context.Background(), tg, callbackUpdate(encodeCallback(cbDownload, id, 0)))
 
@@ -756,7 +890,7 @@ func TestDownloadCallbackIndexOutOfRange(t *testing.T) {
 	h, _ := newTestHandlers(&fakeSearcher{}, tr)
 	tg := &fakeTG{}
 
-	id := h.cache.Put(cachedSearch{Query: "q", Releases: []prowlarr.Release{{Title: "T"}}})
+	id := h.cache.Put(cachedSearch{Query: searchFor("q"), Releases: []prowlarr.Release{{Title: "T"}}})
 
 	h.HandleCallback(context.Background(), tg, callbackUpdate(encodeCallback(cbDownload, id, 5)))
 
@@ -800,7 +934,7 @@ func TestDetailsCallbackShowsFilesAndOffersDownload(t *testing.T) {
 	)}
 	h, _ := newTestHandlers(s, &fakeTrans{})
 	tg := &fakeTG{}
-	id := h.cache.Put(cachedSearch{Query: "космос", Releases: releases})
+	id := h.cache.Put(cachedSearch{Query: searchFor("космос"), Releases: releases})
 
 	h.HandleCallback(context.Background(), tg, callbackUpdate(encodeCallback(cbInfo, id, 1)))
 
@@ -848,7 +982,7 @@ func TestDetailsCallbackDownloadsNothing(t *testing.T) {
 	tr := &fakeTrans{hash: "abc"}
 	h, subs := newTestHandlers(s, tr)
 	tg := &fakeTG{}
-	id := h.cache.Put(cachedSearch{Query: "q", Releases: releases})
+	id := h.cache.Put(cachedSearch{Query: searchFor("q"), Releases: releases})
 
 	h.HandleCallback(context.Background(), tg, callbackUpdate(encodeCallback(cbInfo, id, 0)))
 
@@ -867,7 +1001,7 @@ func TestDetailsCallbackMarksAlreadyGrabbed(t *testing.T) {
 	h, subs := newTestHandlers(s, &fakeTrans{})
 	subs.recorded = []store.Download{{ID: 1, Hash: "aabbcc", Status: store.StatusDone}}
 	tg := &fakeTG{}
-	id := h.cache.Put(cachedSearch{Query: "q", Releases: releases})
+	id := h.cache.Put(cachedSearch{Query: searchFor("q"), Releases: releases})
 
 	h.HandleCallback(context.Background(), tg, callbackUpdate(encodeCallback(cbInfo, id, 0)))
 
@@ -912,7 +1046,7 @@ func TestDetailsCallbackWithoutTorrentFile(t *testing.T) {
 			s := &fakeSearcher{releases: releases, torrent: tt.torrent, fetchErr: tt.fetchErr}
 			h, _ := newTestHandlers(s, &fakeTrans{})
 			tg := &fakeTG{}
-			id := h.cache.Put(cachedSearch{Query: "q", Releases: releases})
+			id := h.cache.Put(cachedSearch{Query: searchFor("q"), Releases: releases})
 
 			h.HandleCallback(context.Background(), tg, callbackUpdate(encodeCallback(cbInfo, id, 0)))
 
@@ -939,7 +1073,7 @@ func TestDetailsCallbackWithoutTorrentFile(t *testing.T) {
 func TestDetailsCallbackStaleIndex(t *testing.T) {
 	h, _ := newTestHandlers(&fakeSearcher{}, &fakeTrans{})
 	tg := &fakeTG{}
-	id := h.cache.Put(cachedSearch{Query: "q", Releases: nReleases(2)})
+	id := h.cache.Put(cachedSearch{Query: searchFor("q"), Releases: nReleases(2)})
 
 	h.HandleCallback(context.Background(), tg, callbackUpdate(encodeCallback(cbInfo, id, 9)))
 
@@ -954,7 +1088,7 @@ func TestPageCallbackEditsKeyboard(t *testing.T) {
 	h, _ := newTestHandlers(&fakeSearcher{}, &fakeTrans{})
 	tg := &fakeTG{}
 
-	id := h.cache.Put(cachedSearch{Query: "q", Releases: nReleases(2*perPage + 5)})
+	id := h.cache.Put(cachedSearch{Query: searchFor("q"), Releases: nReleases(2*perPage + 5)})
 
 	h.HandleCallback(context.Background(), tg, callbackUpdate(encodeCallback(cbPage, id, 1)))
 
@@ -1001,7 +1135,7 @@ func TestPageCallbackEditFailureFallsBackToFreshMessage(t *testing.T) {
 	h, _ := newTestHandlers(&fakeSearcher{}, &fakeTrans{})
 	tg := &fakeTG{editErr: errors.New("message to edit not found")}
 
-	id := h.cache.Put(cachedSearch{Query: "q", Releases: nReleases(2*perPage + 5)})
+	id := h.cache.Put(cachedSearch{Query: searchFor("q"), Releases: nReleases(2*perPage + 5)})
 
 	h.HandleCallback(context.Background(), tg, callbackUpdate(encodeCallback(cbPage, id, 1)))
 
@@ -1021,7 +1155,7 @@ func TestPageCallbackInaccessibleMessageSendsFresh(t *testing.T) {
 	h, _ := newTestHandlers(&fakeSearcher{}, &fakeTrans{})
 	tg := &fakeTG{}
 
-	id := h.cache.Put(cachedSearch{Query: "q", Releases: nReleases(2*perPage + 5)})
+	id := h.cache.Put(cachedSearch{Query: searchFor("q"), Releases: nReleases(2*perPage + 5)})
 	update := &models.Update{CallbackQuery: &models.CallbackQuery{
 		ID:   "cb1",
 		Data: encodeCallback(cbPage, id, 2),
@@ -1070,7 +1204,7 @@ func TestHandleCallbackUnknownKind(t *testing.T) {
 	h, subs := newTestHandlers(&fakeSearcher{}, tr)
 	tg := &fakeTG{}
 
-	id := h.cache.Put(cachedSearch{Query: "q", Releases: nReleases(3)})
+	id := h.cache.Put(cachedSearch{Query: searchFor("q"), Releases: nReleases(3)})
 
 	h.HandleCallback(context.Background(), tg, callbackUpdate("xx:"+id+":0"))
 
@@ -1184,7 +1318,7 @@ func TestCommandAnswersTheChatThatAsked(t *testing.T) {
 
 func TestCallbackAnswersTheChatThatTapped(t *testing.T) {
 	h, _ := newTestHandlers(&fakeSearcher{}, &fakeTrans{})
-	id := h.cache.Put(cachedSearch{Query: "q", Releases: nReleases(12)})
+	id := h.cache.Put(cachedSearch{Query: searchFor("q"), Releases: nReleases(12)})
 
 	tg := &fakeTG{}
 	h.HandleCallback(context.Background(), tg, callbackUpdateFrom(secondChatID, encodeCallback(cbPage, id, 1)))
@@ -1194,7 +1328,7 @@ func TestCallbackAnswersTheChatThatTapped(t *testing.T) {
 
 func TestDownloadConfirmsToTheChatThatTapped(t *testing.T) {
 	h, _ := newTestHandlers(&fakeSearcher{}, &fakeTrans{})
-	id := h.cache.Put(cachedSearch{Query: "q", Releases: []prowlarr.Release{{
+	id := h.cache.Put(cachedSearch{Query: searchFor("q"), Releases: []prowlarr.Release{{
 		Title: "Release", MagnetURL: "magnet:?xt=urn:btih:abc",
 	}}})
 
@@ -1266,11 +1400,13 @@ func TestNewBotOffline(t *testing.T) {
 
 // --- subscribe button ---
 
-func TestSubscribeButtonUsesTheSearchQueryVerbatim(t *testing.T) {
+// A search without exclusions subscribes to exactly the words that were typed;
+// TestSubscribeButtonKeepsTheExclusions covers what happens when it has some.
+func TestSubscribeButtonUsesAPlainSearchQueryVerbatim(t *testing.T) {
 	const query = "формула 1 2026 2160p rus"
 	h, subs := newTestHandlers(&fakeSearcher{}, &fakeTrans{})
 	tg := &fakeTG{}
-	id := h.cache.Put(cachedSearch{Query: query, Releases: nReleases(3)})
+	id := h.cache.Put(cachedSearch{Query: searchFor(query), Releases: nReleases(3)})
 
 	before := time.Now().UTC()
 	h.HandleCallback(context.Background(), tg, callbackUpdateFrom(testChatID, encodeCallback(cbSub, id, 0)))
@@ -1283,7 +1419,7 @@ func TestSubscribeButtonUsesTheSearchQueryVerbatim(t *testing.T) {
 		t.Errorf("subscription query = %q, want the search text unchanged (%q)", got.Query, query)
 	}
 	if len(got.Include) != 0 || len(got.Exclude) != 0 {
-		t.Errorf("subscription filters = %v/%v, want none", got.Include, got.Exclude)
+		t.Errorf("subscription filters = %v/%v, want none from a query that has none", got.Include, got.Exclude)
 	}
 	if got.CutoffAt.Before(before) {
 		t.Errorf("cutoff = %v, want a cutoff of roughly now (%v)", got.CutoffAt, before)
@@ -1298,7 +1434,7 @@ func TestSubscribeButtonReportsStoreFailure(t *testing.T) {
 	h, subs := newTestHandlers(&fakeSearcher{}, &fakeTrans{})
 	subs.createErr = errors.New("disk full")
 	tg := &fakeTG{}
-	id := h.cache.Put(cachedSearch{Query: "space show", Releases: nReleases(1)})
+	id := h.cache.Put(cachedSearch{Query: searchFor("space show"), Releases: nReleases(1)})
 
 	h.HandleCallback(context.Background(), tg, callbackUpdateFrom(testChatID, encodeCallback(cbSub, id, 0)))
 

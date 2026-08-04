@@ -5,13 +5,8 @@ the binary: after an update the bot posts the entry matching the version it is
 running, so keep entries short, plain, and headed `## v<version>` — the same
 version the git tag carries.
 
-## v1.11.0
+## v1.12.0
 
-- Search results now arrive as a new message instead of replacing the
-  "🔎 Searching…" one. A search can run for minutes, and an edited message
-  raises no Telegram notification — so you had to keep checking the chat to
-  see whether it had finished. Now your phone tells you. The same goes for
-  "no results" and for a search that failed.
 - `/status` can now delete. Every download it lists — running or recently
   finished — is numbered and has a matching 🗑 button underneath. Tap one,
   confirm, and the torrent goes from Transmission along with the files it
@@ -21,6 +16,14 @@ version the git tag carries.
 - An entry that reads "not in Transmission (removed externally?)" can be
   cleared the same way, so a download you removed elsewhere stops haunting the
   list.
+
+## v1.11.0
+
+- Search results now arrive as a new message instead of replacing the
+  "🔎 Searching…" one. A search can run for minutes, and an edited message
+  raises no Telegram notification — so you had to keep checking the chat to
+  see whether it had finished. Now your phone tells you. The same goes for
+  "no results" and for a search that failed.
 
 ## v1.10.0
 

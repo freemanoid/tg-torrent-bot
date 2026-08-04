@@ -317,6 +317,29 @@ func (s *Store) ActiveDownloads(ctx context.Context) ([]Download, error) {
 	return dls, nil
 }
 
+// GetDownload returns one recorded download by info hash, whatever its status.
+// The hash is matched case-insensitively, like FindDownloads does, so a caller
+// holding Transmission's casing finds the row the bot stored. An unknown hash
+// is ErrNotFound.
+func (s *Store) GetDownload(ctx context.Context, hash string) (Download, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, hash, title, source, status, added_at
+		FROM downloads WHERE lower(hash) = ?`, strings.ToLower(hash))
+	if err != nil {
+		return Download{}, fmt.Errorf("get download %s: %w", hash, err)
+	}
+	defer rows.Close()
+
+	dls, err := scanDownloads(rows)
+	if err != nil {
+		return Download{}, fmt.Errorf("get download %s: %w", hash, err)
+	}
+	if len(dls) == 0 {
+		return Download{}, fmt.Errorf("download %s: %w", hash, ErrNotFound)
+	}
+	return dls[0], nil
+}
+
 // FindDownloads returns the recorded downloads matching any of the given info
 // hashes (case-insensitively, because Transmission's hash casing is not
 // guaranteed to match what a release advertised) or any of the exact titles.

@@ -27,6 +27,10 @@ It does two things:
    the `backlog` filter when you do want what is already on the tracker. Each
    grab is announced with a 🗑 button that removes the torrent and deletes its
    files, for the times the bot guessed wrong.
+3. **Housekeeping** — `/status` lists everything the bot has, running and
+   recently finished, each entry numbered with a matching 🗑 button. Tap one and
+   confirm to remove that torrent from Transmission and delete what it wrote to
+   disk, whether it came from a search or from a subscription.
 
 After an app update the bot posts what it is now running — the new version and
 that version's [CHANGELOG.md](CHANGELOG.md) entry — once per release, so a
@@ -185,7 +189,7 @@ setup mode and waits for the form.
 | `/unsub <id>` | Remove a subscription |
 | `/pause <id>` | Pause or resume a subscription |
 | `/test <id>` | Dry-run: show what WOULD match right now, download nothing |
-| `/status` | Active downloads with progress bars, plus recently completed ones |
+| `/status` | Active downloads with progress bars, plus recently completed ones; tap 🗑*number* to delete one |
 | `/help` | Usage summary |
 | `/start` | Same as `/help` |
 

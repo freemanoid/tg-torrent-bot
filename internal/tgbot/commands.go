@@ -27,6 +27,9 @@ type SubscriptionStore interface {
 	DeleteSubscription(ctx context.Context, id int64) error
 	SetSubscriptionPaused(ctx context.Context, id int64, paused bool) error
 	ActiveDownloads(ctx context.Context) ([]store.Download, error)
+	// GetDownload reads one recorded download by info hash, so a delete
+	// confirmation can name what it is about to destroy.
+	GetDownload(ctx context.Context, hash string) (store.Download, error)
 	// FindDownloads looks up what the bot already did with the given releases,
 	// matched by info hash or exact title.
 	FindDownloads(ctx context.Context, hashes, titles []string) ([]store.Download, error)
@@ -49,6 +52,14 @@ const maxDryRunLines = 10
 // Done rows are never deleted, so this is what keeps the command readable on a
 // phone years into an install.
 const maxCompletedLines = 10
+
+// maxDeleteButtons caps how many 🗑 buttons /status offers. ActiveDownloads has
+// no limit of its own, so without this a busy install would hand Telegram a
+// keyboard of unbounded size; the list itself is still shown in full.
+const maxDeleteButtons = 25
+
+// deleteButtonsPerRow keeps the 🗑 row narrow enough to read on a phone.
+const deleteButtonsPerRow = 5
 
 // completedFormat renders the added-at timestamp in /status history.
 const completedFormat = "2006-01-02 15:04"
@@ -74,7 +85,8 @@ Commands:
 /unsub <id> — remove a subscription
 /pause <id> — pause or resume a subscription
 /test <id> — dry run: show what would match now, download nothing
-/status — active downloads with progress
+/status — active downloads with progress, and what finished recently.
+  Tap 🗑<number> to delete one: it goes from Transmission, and so do its files.
 /help — this message
 
 Filters (comma-separated, case-insensitive, all optional):
@@ -97,7 +109,7 @@ func commandMenu() []models.BotCommand {
 		{Command: "unsub", Description: "Remove a subscription: /unsub <id>"},
 		{Command: "pause", Description: "Pause or resume a subscription: /pause <id>"},
 		{Command: "test", Description: "Dry-run a subscription: /test <id>"},
-		{Command: "status", Description: "Active downloads with progress"},
+		{Command: "status", Description: "Downloads with progress; 🗑 to delete one"},
 		{Command: "help", Description: "How to use the bot"},
 	}
 }
@@ -358,7 +370,10 @@ func (h *Handlers) cmdTest(ctx context.Context, api telegramAPI, chatID int64, a
 }
 
 // cmdStatus lists the bot's active downloads with live Transmission progress,
-// followed by what it recently finished.
+// followed by what it recently finished. Every entry it lists is numbered and
+// gets a 🗑 button, so anything the bot has can be deleted from here — not only
+// what a subscription grabbed on its own, which is all the notification buttons
+// ever covered.
 func (h *Handlers) cmdStatus(ctx context.Context, api telegramAPI, chatID int64) {
 	active, err := h.subs.ActiveDownloads(ctx)
 	if err != nil {
@@ -375,26 +390,63 @@ func (h *Handlers) cmdStatus(ctx context.Context, api telegramAPI, chatID int64)
 		return
 	}
 
+	// The numbering runs across both sections, because the buttons sit under the
+	// message as one row rather than beside the line they belong to.
 	var sections []string
 	if len(active) > 0 {
-		sections = append(sections, h.activeSection(ctx, active))
+		sections = append(sections, h.activeSection(ctx, active, 1))
 	}
 	if len(completed) > 0 {
-		sections = append(sections, completedSection(completed))
+		sections = append(sections, completedSection(completed, len(active)+1))
 	}
-	h.reply(ctx, api, chatID, strings.Join(sections, "\n\n"))
+	listed := make([]store.Download, 0, len(active)+len(completed))
+	listed = append(listed, active...)
+	listed = append(listed, completed...)
+	if len(listed) > maxDeleteButtons {
+		// Saying so beats a list whose tail silently has no buttons.
+		sections = append(sections, fmt.Sprintf("🗑 buttons cover the first %d entries.", maxDeleteButtons))
+	}
+	h.replyWithKeyboard(ctx, api, chatID, strings.Join(sections, "\n\n"), statusKeyboard(listed))
 }
 
-// activeSection renders the running downloads with live Transmission progress.
-// A Transmission outage costs this section its progress figures only — the
-// history rendered beside it comes from the store and stays readable.
-func (h *Handlers) activeSection(ctx context.Context, active []store.Download) string {
+// statusKeyboard offers one 🗑 button per listed download, labelled with that
+// download's number in the list — the same way the ℹ️ and 🔗 rows under search
+// results refer to their blocks. Each button carries its own info hash, so it
+// keeps working for as long as the message exists.
+func statusKeyboard(listed []store.Download) *models.InlineKeyboardMarkup {
+	shown := min(len(listed), maxDeleteButtons)
+	btns := make([]models.InlineKeyboardButton, 0, shown)
+	for i, dl := range listed[:shown] {
+		if dl.Hash == "" {
+			continue // nothing to act on; the entry is still listed
+		}
+		btns = append(btns, models.InlineKeyboardButton{
+			Text:         fmt.Sprintf("🗑%d", i+1),
+			CallbackData: encodeCallback(cbStatusDel, dl.Hash, 0),
+		})
+	}
+
+	rows := make([][]models.InlineKeyboardButton, 0, (len(btns)+deleteButtonsPerRow-1)/deleteButtonsPerRow)
+	for start := 0; start < len(btns); start += deleteButtonsPerRow {
+		rows = append(rows, btns[start:min(start+deleteButtonsPerRow, len(btns))])
+	}
+	return &models.InlineKeyboardMarkup{InlineKeyboard: rows}
+}
+
+// activeSection renders the running downloads with live Transmission progress,
+// numbering them from first. A Transmission outage costs this section its
+// progress figures only — the history rendered beside it comes from the store
+// and stays readable.
+func (h *Handlers) activeSection(ctx context.Context, active []store.Download, first int) string {
 	statuses, err := h.trans.Active(ctx)
 	if err != nil {
 		var b strings.Builder
 		fmt.Fprintf(&b, "⬇️ Active downloads (Transmission unreachable: %v):\n", err)
-		for _, dl := range active {
-			b.WriteString("\n• " + dl.Title)
+		// Numbered even here: the 🗑 buttons are still there, and a list that
+		// stopped numbering when Transmission went down would leave them
+		// pointing at nothing the reader can identify.
+		for i, dl := range active {
+			fmt.Fprintf(&b, "\n%d. %s", first+i, dl.Title)
 		}
 		return b.String()
 	}
@@ -407,8 +459,8 @@ func (h *Handlers) activeSection(ctx context.Context, active []store.Download) s
 
 	var b strings.Builder
 	b.WriteString("⬇️ Active downloads:\n")
-	for _, dl := range active {
-		b.WriteString("\n• " + dl.Title + "\n    ")
+	for i, dl := range active {
+		fmt.Fprintf(&b, "\n%d. %s\n    ", first+i, dl.Title)
 		st, ok := byHash[strings.ToLower(dl.Hash)]
 		switch {
 		case !ok:
@@ -423,14 +475,14 @@ func (h *Handlers) activeSection(ctx context.Context, active []store.Download) s
 	return b.String()
 }
 
-// completedSection renders the recent history. The store records when a
-// download was added, not when it finished, so the line says so rather than
-// implying a completion time it does not have.
-func completedSection(completed []store.Download) string {
+// completedSection renders the recent history, numbering it from first. The
+// store records when a download was added, not when it finished, so the line
+// says so rather than implying a completion time it does not have.
+func completedSection(completed []store.Download, first int) string {
 	var b strings.Builder
 	b.WriteString("✅ Recently completed:\n")
-	for _, dl := range completed {
-		fmt.Fprintf(&b, "\n• %s — added %s", dl.Title, dl.AddedAt.UTC().Format(completedFormat))
+	for i, dl := range completed {
+		fmt.Fprintf(&b, "\n%d. %s — added %s", first+i, dl.Title, dl.AddedAt.UTC().Format(completedFormat))
 	}
 	return b.String()
 }

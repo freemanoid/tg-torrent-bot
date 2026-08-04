@@ -456,6 +456,28 @@ func TestRemoveTorrentResolvesHashAndDeletesData(t *testing.T) {
 	}
 }
 
+// The hash is lower-cased before it is looked up, the same way the status
+// listing matches on it: an empty torrent-get is read as "Transmission does not
+// have this torrent" and closes the download's row, so a lookup that missed
+// only on casing would throw away a torrent that is still running.
+func TestRemoveTorrentLowerCasesTheHash(t *testing.T) {
+	c, _ := newFake(t, func(t *testing.T, method string, args map[string]any) (string, any) {
+		if method == "torrent-get" {
+			if ids, _ := args["ids"].([]any); len(ids) != 1 || ids[0] != "abc123" {
+				t.Errorf("torrent-get ids = %v, want [abc123] lower-cased", args["ids"])
+			}
+			return "success", map[string]any{
+				"torrents": []any{map[string]any{"id": 42, "hashString": "abc123"}},
+			}
+		}
+		return "success", nil
+	})
+
+	if err := c.RemoveTorrent(context.Background(), "ABC123"); err != nil {
+		t.Fatalf("RemoveTorrent(upper-case) = %v", err)
+	}
+}
+
 // A torrent Transmission no longer has is not a failure to report as one: the
 // button that triggers this lives in every allowed chat, so the second tap
 // must be able to say "already removed".

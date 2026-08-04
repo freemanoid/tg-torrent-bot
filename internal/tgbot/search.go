@@ -275,6 +275,15 @@ func (h *Handlers) HandleCallback(ctx context.Context, api telegramAPI, update *
 	case cbRejectNo:
 		h.keepRejected(ctx, api, cb, chatID, ref)
 		return
+	case cbStatusDel:
+		h.offerStatusDelete(ctx, api, chatID, ref)
+		return
+	case cbStatusDelOK:
+		h.statusDelete(ctx, api, cb, chatID, ref)
+		return
+	case cbStatusDelNo:
+		h.keepStatusDelete(ctx, api, cb, chatID)
+		return
 	}
 
 	entry, ok := h.cache.Get(ref)
@@ -394,14 +403,115 @@ func (h *Handlers) reject(ctx context.Context, api telegramAPI, cb *models.Callb
 	// watcher will close it out as *completed* — so the failure is reported
 	// rather than only logged, or the chat would later claim the bot finished
 	// downloading something the user had just thrown away.
-	msg := "🗑 Removed, and the downloaded files are deleted."
-	if err := h.subs.CancelDownload(ctx, hash); err != nil && !errors.Is(err, store.ErrNotFound) {
-		h.log.Error("cancel download", "hash", hash, "error", err)
-		msg += fmt.Sprintf("\n\n⚠️ The bot could not update its own records (%v),"+
-			" so this may still show up as finished in /status.", err)
-	}
+	msg := "🗑 Removed, and the downloaded files are deleted." + h.closeRow(ctx, hash)
 	h.swapKeyboard(ctx, api, cb, chatID, clearedKeyboard(), "")
 	h.reply(ctx, api, chatID, msg)
+}
+
+// closeRow marks a removed download cancelled and returns the warning to append
+// when that write failed — "" when the row was closed, or was never there to
+// close. If the write fails the torrent is still gone but the row stays active,
+// and the watcher will close it out as *completed*, so the failure is reported
+// rather than only logged: the chat must not later claim the bot finished
+// downloading something the user had just thrown away.
+func (h *Handlers) closeRow(ctx context.Context, hash string) string {
+	err := h.subs.CancelDownload(ctx, hash)
+	if err == nil || errors.Is(err, store.ErrNotFound) {
+		return ""
+	}
+	h.log.Error("cancel download", "hash", hash, "error", err)
+	return fmt.Sprintf("\n\n⚠️ The bot could not update its own records (%v),"+
+		" so this may still show up as finished in /status.", err)
+}
+
+// maxConfirmTitleRunes caps the title echoed in a delete confirmation; release
+// titles run long, and the question has to stay readable.
+const maxConfirmTitleRunes = 120
+
+// offerStatusDelete asks before deleting an entry listed by /status. The
+// question goes in a new message naming the release rather than swapping the
+// list's keyboard the way a grab notification does: that list carries one
+// button per download, and a bare yes/no in their place would not say which
+// entry it meant. Leaving the list intact also lets several be deleted in a row.
+func (h *Handlers) offerStatusDelete(ctx context.Context, api telegramAPI, chatID int64, hash string) {
+	// A title makes the question unambiguous, but it must not be able to block
+	// the deletion: a store that cannot be read still leaves a usable prompt.
+	what := "this download"
+	switch dl, err := h.subs.GetDownload(ctx, hash); {
+	case err == nil && dl.Title != "":
+		what = "«" + truncate(dl.Title, maxConfirmTitleRunes) + "»"
+	case err != nil && !errors.Is(err, store.ErrNotFound):
+		h.log.Warn("look up download", "hash", hash, "error", err)
+	}
+	if _, err := api.SendMessage(ctx, &bot.SendMessageParams{
+		ChatID:      chatID,
+		Text:        "🗑 Delete " + what + " and the files it has downloaded?",
+		ReplyMarkup: statusDeleteConfirmKeyboard(hash),
+	}); err != nil {
+		h.log.Error("send delete confirmation", "error", err)
+	}
+}
+
+// statusDelete removes a download listed by /status from Transmission along
+// with its data, then closes its store row and turns the confirmation into the
+// outcome.
+//
+// Unlike a rejected grab, a torrent Transmission no longer has still closes the
+// row here: this tap came from the list itself, which shows entries reading
+// "not in Transmission (removed externally?)", and clearing those out is
+// exactly what it is for. A stale button on an older /status message lands here
+// too, and is not a failure.
+func (h *Handlers) statusDelete(ctx context.Context, api telegramAPI, cb *models.CallbackQuery, chatID int64, hash string) {
+	err := h.trans.RemoveTorrent(ctx, hash)
+	if err != nil && !errors.Is(err, transmission.ErrNotFound) {
+		// Nothing was removed, so the row stays as it is and the confirmation
+		// keeps its buttons for a retry.
+		h.reply(ctx, api, chatID, fmt.Sprintf("Failed to remove the download: %v", err))
+		return
+	}
+
+	msg := "🗑 Removed, and the downloaded files are deleted."
+	if err != nil {
+		msg = "🗑 Transmission no longer had it — cleared from /status."
+	}
+	h.replaceMessage(ctx, api, cb, chatID, msg+h.closeRow(ctx, hash), clearedKeyboard())
+}
+
+// keepStatusDelete abandons the confirmation. Nothing was deleted, so the
+// message has no reason to keep its buttons — the list it came from still has
+// its own, and a confirmation left armed in the history is a stray tap waiting
+// to happen.
+func (h *Handlers) keepStatusDelete(ctx context.Context, api telegramAPI, cb *models.CallbackQuery, chatID int64) {
+	h.replaceMessage(ctx, api, cb, chatID, "↩️ Kept — nothing was deleted.", clearedKeyboard())
+}
+
+// replaceMessage rewrites the message a callback came from, text and keyboard
+// both, falling back to a new message when the original is out of reach. It is
+// swapKeyboard's counterpart for a message the bot wrote to be replaced: the
+// confirmation has served its purpose once it is answered.
+func (h *Handlers) replaceMessage(ctx context.Context, api telegramAPI, cb *models.CallbackQuery, chatID int64, text string, kb *models.InlineKeyboardMarkup) {
+	if msg := cb.Message.Message; msg != nil {
+		_, err := api.EditMessageText(ctx, &bot.EditMessageTextParams{
+			ChatID:      chatID,
+			MessageID:   msg.ID,
+			Text:        text,
+			ReplyMarkup: kb,
+		})
+		if err == nil {
+			return
+		}
+		h.log.Warn("replace confirmation message", "error", err)
+	}
+	h.reply(ctx, api, chatID, text)
+}
+
+// statusDeleteConfirmKeyboard asks before deleting something listed by /status.
+// The files go with the torrent, so the confirmation is not a formality.
+func statusDeleteConfirmKeyboard(hash string) *models.InlineKeyboardMarkup {
+	return &models.InlineKeyboardMarkup{InlineKeyboard: [][]models.InlineKeyboardButton{{
+		{Text: "🗑 Yes, delete", CallbackData: encodeCallback(cbStatusDelOK, hash, 0)},
+		{Text: "↩️ Keep", CallbackData: encodeCallback(cbStatusDelNo, hash, 0)},
+	}}}
 }
 
 // clearedKeyboard is an explicitly empty keyboard, used once a notification
@@ -538,6 +648,25 @@ func (h *Handlers) download(ctx context.Context, api telegramAPI, chatID int64, 
 func (h *Handlers) reply(ctx context.Context, api telegramAPI, chatID int64, text string) {
 	for _, chunk := range splitMessage(text, maxMessageLen) {
 		if _, err := api.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: chunk}); err != nil {
+			h.log.Error("send message", "error", err)
+			return
+		}
+	}
+}
+
+// replyWithKeyboard is reply with an inline keyboard under the final chunk.
+// A results page cannot be chunked at all — its buttons name blocks by the
+// position they occupy in that one message — but /status buttons carry their
+// own info hash and are labelled with the entry's number, so a list long enough
+// to span messages still ends in a working keyboard.
+func (h *Handlers) replyWithKeyboard(ctx context.Context, api telegramAPI, chatID int64, text string, kb *models.InlineKeyboardMarkup) {
+	chunks := splitMessage(text, maxMessageLen)
+	for i, chunk := range chunks {
+		params := &bot.SendMessageParams{ChatID: chatID, Text: chunk}
+		if i == len(chunks)-1 {
+			params.ReplyMarkup = kb
+		}
+		if _, err := api.SendMessage(ctx, params); err != nil {
 			h.log.Error("send message", "error", err)
 			return
 		}

@@ -441,6 +441,41 @@ func TestCompleteDownloadUnknownHash(t *testing.T) {
 	}
 }
 
+func TestGetDownload(t *testing.T) {
+	s := openMem(t)
+	ctx := context.Background()
+
+	if err := s.AddDownload(ctx, "AABBCC", "Space Show S01E01", "sub:1"); err != nil {
+		t.Fatalf("AddDownload = %v", err)
+	}
+
+	// Transmission's casing need not match what was stored.
+	dl, err := s.GetDownload(ctx, "aabbcc")
+	if err != nil {
+		t.Fatalf("GetDownload = %v", err)
+	}
+	if dl.Title != "Space Show S01E01" || dl.Source != "sub:1" || dl.Status != StatusActive {
+		t.Errorf("GetDownload = %+v, want the stored row", dl)
+	}
+
+	// A cancelled row is still readable: the delete confirmation has to be able
+	// to name what a stale button points at.
+	if err := s.CancelDownload(ctx, "AABBCC"); err != nil {
+		t.Fatalf("CancelDownload = %v", err)
+	}
+	if dl, err = s.GetDownload(ctx, "AABBCC"); err != nil || dl.Status != StatusCancelled {
+		t.Errorf("GetDownload after cancel = (%+v, %v), want the cancelled row", dl, err)
+	}
+}
+
+func TestGetDownloadUnknownHash(t *testing.T) {
+	s := openMem(t)
+
+	if _, err := s.GetDownload(context.Background(), "no-such-hash"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("GetDownload(unknown) = %v, want ErrNotFound", err)
+	}
+}
+
 func TestFindDownloads(t *testing.T) {
 	s := openMem(t)
 	ctx := context.Background()

@@ -122,11 +122,24 @@ decisions carry it:
   already grabbed part of their backlog, and `maxGrabsPerTick` may have
   deferred the rest; a retroactive cutoff would strand it permanently.
 
-## Rejecting a grab
+## Deleting a download
+
+Two entry points, one meaning: the torrent leaves Transmission **with its data**
+and its row is marked `cancelled`. `Handlers.closeRow` is the shared tail — it
+runs `CancelDownload` and returns the ⚠️ warning to append when that write
+fails. Keep it shared: a row left `active` after the torrent is gone gets closed
+out by the watcher as *finished*, which would tell the chat the bot downloaded
+something the user had just thrown away.
+
+`transmission.RemoveTorrent` lower-cases the hash before resolving it, the same
+way `activeSection` matches. It has to: an empty `torrent-get` is what produces
+`ErrNotFound`, callers read that as "already gone", and a miss on casing alone
+would cancel the row of a torrent that is still running.
+
+### Rejecting a grab
 
 Every subscription grab and every subscription completion carries a 🗑 button
-(`cbReject` → `cbRejectOK`/`cbRejectNo`). Confirming removes the torrent from
-Transmission **with its data** and marks the row `cancelled`.
+(`cbReject` → `cbRejectOK`/`cbRejectNo`).
 
 - **The reject callbacks carry an info hash, not a search id**, so
   `HandleCallback` routes them *before* the search-cache lookup — the
@@ -141,6 +154,33 @@ Transmission **with its data** and marks the row `cancelled`.
   removed", never as a failure.
 - **A cancelled download is unmarked in search results** — its data is gone, so
   showing ⬇️ or ✅ for it would be a lie.
+
+### Deleting from `/status`
+
+`/status` numbers every entry it lists — running *and* recently finished — and
+carries a matching row of 🗑N buttons (`cbStatusDel` → `cbStatusDelOK`/
+`cbStatusDelNo`). This is the only way to delete something the user picked out
+of search results; the notification buttons only ever covered subscription
+grabs.
+
+- **It gets its own callback kinds rather than reusing `cbReject`.** Those swap
+  the keyboard on the message they sit on, and a `/status` message carries one
+  button per download — an unlabelled yes/no in their place would not say which
+  entry it meant. Instead `offerStatusDelete` sends a *new* message naming the
+  release (hence `store.GetDownload`), and `replaceMessage` rewrites that
+  message into the outcome. The listing keeps its keyboard, so several
+  downloads can be deleted in a row.
+- **`ErrNotFound` still closes the row here**, unlike in `reject`. The tap came
+  from the list, which shows entries reading "not in Transmission (removed
+  externally?)"; clearing those out is exactly what it is for, and a stale
+  button on an older listing lands in the same branch.
+- **A failed removal changes nothing and keeps its buttons** — the confirmation
+  stays armed so it can simply be tapped again.
+- **`replyWithKeyboard` puts the keyboard on the last chunk.** A results page
+  cannot be chunked at all because its buttons name blocks by position; these
+  carry their own hash and are labelled by number, so a long list may span
+  messages. Buttons are capped at `maxDeleteButtons` (`ActiveDownloads` has no
+  limit of its own) and the message says so when the list is longer.
 
 The `meta` table is a plain key/value store for bookkeeping that belongs to the
 install rather than to a subscription; today it holds `announced_version`.
@@ -345,7 +385,9 @@ TTL.
   subscription built from `Raw` would search for the literal "-AV1", one built
   from `Terms` alone would auto-grab what the user was avoiding.
 - **Telegram messages are chunked at 4096 chars**; unbounded replies (`/subs`,
-  `/status`) would otherwise silently fail to send.
+  `/status`) would otherwise silently fail to send. `/status` keeps chunking
+  even though it now carries a keyboard — see
+  [Deleting from `/status`](#deleting-from-status).
 - **The details view fetches the .torrent and throws it away.** `ℹ️` parses the
   metainfo with `internal/torrentmeta` purely to list files; the bytes are not
   cached (they can be tens of megabytes on a RAM-tight Pi) and a failed fetch is

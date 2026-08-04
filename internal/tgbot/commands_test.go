@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-telegram/bot/models"
+
 	"github.com/freemanoid/tg-torrent-bot/internal/prowlarr"
 	"github.com/freemanoid/tg-torrent-bot/internal/store"
 	"github.com/freemanoid/tg-torrent-bot/internal/transmission"
@@ -43,6 +45,7 @@ type fakeSubStore struct {
 	addDLErr   error
 	cancelled  []string
 	cancelErr  error
+	getDLErr   error
 }
 
 func newFakeSubStore(subs ...store.Subscription) *fakeSubStore {
@@ -154,6 +157,22 @@ func (f *fakeSubStore) AddDownload(_ context.Context, hash, title, source string
 	}
 	f.added = append(f.added, recordedDownload{hash, title, source})
 	return nil
+}
+
+// GetDownload finds a download among everything the fake knows about, matching
+// the hash case-insensitively the way the store does.
+func (f *fakeSubStore) GetDownload(_ context.Context, hash string) (store.Download, error) {
+	if f.getDLErr != nil {
+		return store.Download{}, f.getDLErr
+	}
+	for _, group := range [][]store.Download{f.active, f.completed, f.recorded} {
+		for _, dl := range group {
+			if strings.EqualFold(dl.Hash, hash) {
+				return dl, nil
+			}
+		}
+	}
+	return store.Download{}, fmt.Errorf("download %s: %w", hash, store.ErrNotFound)
 }
 
 var _ SubscriptionStore = (*fakeSubStore)(nil)
@@ -758,7 +777,7 @@ func TestStatusCommandCapsCompleted(t *testing.T) {
 
 	command(t, h, tg, "/status")
 
-	if got := strings.Count(tg.lastSentText(t), "\n• "); got != maxCompletedLines {
+	if got := strings.Count(tg.lastSentText(t), " — added "); got != maxCompletedLines {
 		t.Errorf("status listed %d completed downloads, want %d", got, maxCompletedLines)
 	}
 }
@@ -808,7 +827,11 @@ func TestStatusCommandTransmissionError(t *testing.T) {
 	}
 	// Only the live progress figures need Transmission. Both lists come from
 	// the store, so an outage must not hide them.
-	for _, want := range []string{"Still Running", "From History"} {
+	//
+	// The numbering has to survive the outage too: the 🗑 buttons are still
+	// there and are labelled by number, so a list that stopped numbering would
+	// leave them pointing at nothing the reader can identify.
+	for _, want := range []string{"1. Still Running", "2. From History"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("reply %q lost %q to the Transmission outage", got, want)
 		}
@@ -836,6 +859,140 @@ func TestStatusCommandHashMatchingIsCaseInsensitive(t *testing.T) {
 	}
 	if !strings.Contains(got, "50%") {
 		t.Errorf("status reply %q missing the 50%% progress", got)
+	}
+}
+
+// --- /status delete buttons ---
+
+// buttonsOf flattens a keyboard's rows, which is how the 🗑 row is read: it is
+// wrapped for width, not for meaning.
+func buttonsOf(t *testing.T, markup models.ReplyMarkup) []models.InlineKeyboardButton {
+	t.Helper()
+	var btns []models.InlineKeyboardButton
+	for _, row := range keyboardOf(t, markup).InlineKeyboard {
+		btns = append(btns, row...)
+	}
+	return btns
+}
+
+// The buttons sit under the whole message rather than beside their line, so
+// their numbers are the only thing tying them to an entry.
+func TestStatusCommandOffersOneDeleteButtonPerEntry(t *testing.T) {
+	subs := newFakeSubStore()
+	// A search download and a subscription grab side by side: /status offers the
+	// button for both, which is the whole point — the notification buttons only
+	// ever covered what a subscription grabbed by itself.
+	subs.active = []store.Download{
+		{ID: 1, Hash: "aaa", Title: "Running", Source: sourceSearch, Status: store.StatusActive},
+		{ID: 2, Hash: "bbb", Title: "Also Running", Source: "sub:1", Status: store.StatusActive},
+	}
+	subs.completed = []store.Download{
+		{ID: 3, Hash: "ccc", Title: "Finished", Source: sourceSearch, Status: store.StatusDone},
+	}
+	tr := &fakeTrans{statuses: []transmission.TorrentStatus{{Hash: "aaa", Percent: 0.5}}}
+	h := newCommandHandlers(&fakeSearcher{}, tr, subs)
+	tg := &fakeTG{}
+
+	command(t, h, tg, "/status")
+
+	got := tg.lastSentText(t)
+	// The numbering runs on across the section break.
+	for _, want := range []string{"1. Running", "2. Also Running", "3. Finished"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("status reply %q missing %q", got, want)
+		}
+	}
+
+	btns := buttonsOf(t, tg.sent[len(tg.sent)-1].ReplyMarkup)
+	if len(btns) != 3 {
+		t.Fatalf("keyboard has %d buttons, want one per listed download", len(btns))
+	}
+	for i, wantHash := range []string{"aaa", "bbb", "ccc"} {
+		if want := fmt.Sprintf("🗑%d", i+1); btns[i].Text != want {
+			t.Errorf("button %d label = %q, want %q", i, btns[i].Text, want)
+		}
+		kind, hash, _, err := decodeCallback(btns[i].CallbackData)
+		if err != nil || kind != cbStatusDel || hash != wantHash {
+			t.Errorf("button %d = (%q, %q, %v), want a delete for %q", i, kind, hash, err, wantHash)
+		}
+	}
+}
+
+// The active list has no limit of its own, so the keyboard needs one — and
+// saying so beats a tail of entries whose buttons are silently missing.
+func TestStatusCommandCapsDeleteButtons(t *testing.T) {
+	subs := newFakeSubStore()
+	for i := range maxDeleteButtons + 3 {
+		subs.active = append(subs.active, store.Download{
+			ID:     int64(i + 1),
+			Hash:   fmt.Sprintf("h%d", i),
+			Title:  fmt.Sprintf("Download %d", i),
+			Status: store.StatusActive,
+		})
+	}
+	h := newCommandHandlers(&fakeSearcher{}, &fakeTrans{}, subs)
+	tg := &fakeTG{}
+
+	command(t, h, tg, "/status")
+
+	last := tg.sent[len(tg.sent)-1]
+	if got := len(buttonsOf(t, last.ReplyMarkup)); got != maxDeleteButtons {
+		t.Errorf("keyboard has %d buttons, want the cap of %d", got, maxDeleteButtons)
+	}
+	if !strings.Contains(last.Text, fmt.Sprintf("first %d entries", maxDeleteButtons)) {
+		t.Errorf("reply %q must say the buttons do not cover the whole list", last.Text)
+	}
+	// Every entry is still listed; only the buttons are capped.
+	whole := ""
+	for _, m := range tg.sent {
+		whole += m.Text
+	}
+	if want := fmt.Sprintf("%d. Download %d", maxDeleteButtons+3, maxDeleteButtons+2); !strings.Contains(whole, want) {
+		t.Errorf("reply lost %q — the cap is on the buttons, not the list", want)
+	}
+}
+
+// Unlike a results page, this list may span messages: its buttons carry their
+// own hash, so the keyboard just rides the last of them.
+func TestStatusCommandLongListKeepsTheKeyboardOnTheLastMessage(t *testing.T) {
+	subs := newFakeSubStore()
+	for i := range 40 {
+		subs.active = append(subs.active, store.Download{
+			ID:     int64(i + 1),
+			Hash:   fmt.Sprintf("h%d", i),
+			Title:  strings.Repeat("Very Long Release Title ", 8) + fmt.Sprintf("%d", i),
+			Status: store.StatusActive,
+		})
+	}
+	h := newCommandHandlers(&fakeSearcher{}, &fakeTrans{}, subs)
+	tg := &fakeTG{}
+
+	command(t, h, tg, "/status")
+
+	if len(tg.sent) < 2 {
+		t.Fatalf("sent %d messages, want the long list chunked", len(tg.sent))
+	}
+	for i, m := range tg.sent[:len(tg.sent)-1] {
+		if m.ReplyMarkup != nil {
+			t.Errorf("chunk %d carries a keyboard; only the last one may", i)
+		}
+		if got := len([]rune(m.Text)); got > maxMessageLen {
+			t.Errorf("chunk %d is %d runes, over the %d limit", i, got, maxMessageLen)
+		}
+	}
+	if got := len(buttonsOf(t, tg.sent[len(tg.sent)-1].ReplyMarkup)); got != maxDeleteButtons {
+		t.Errorf("last chunk has %d buttons, want %d", got, maxDeleteButtons)
+	}
+}
+
+func TestStatusCommandEmptyHasNoKeyboard(t *testing.T) {
+	h := newCommandHandlers(&fakeSearcher{}, &fakeTrans{}, newFakeSubStore())
+	tg := &fakeTG{}
+
+	command(t, h, tg, "/status")
+
+	if tg.sent[0].ReplyMarkup != nil {
+		t.Errorf("reply markup = %v, want none when there is nothing to delete", tg.sent[0].ReplyMarkup)
 	}
 }
 

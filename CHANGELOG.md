@@ -12,6 +12,15 @@ version the git tag carries.
   raises no Telegram notification — so you had to keep checking the chat to
   see whether it had finished. Now your phone tells you. The same goes for
   "no results" and for a search that failed.
+- `/status` can now delete. Every download it lists — running or recently
+  finished — is numbered and has a matching 🗑 button underneath. Tap one,
+  confirm, and the torrent goes from Transmission along with the files it
+  wrote. Until now only the torrents a subscription grabbed by itself could be
+  deleted from the chat, and only from the message announcing them; anything
+  you picked out of search results had to be cleaned up by hand.
+- An entry that reads "not in Transmission (removed externally?)" can be
+  cleared the same way, so a download you removed elsewhere stops haunting the
+  list.
 
 ## v1.10.0
 

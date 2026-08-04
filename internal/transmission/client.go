@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	transmissionrpc "github.com/hekmon/transmissionrpc/v3"
@@ -132,6 +133,11 @@ func (c *Client) RemoveTorrent(ctx context.Context, hash string) error {
 	if hash == "" {
 		return errors.New("empty info hash")
 	}
+	// Lower-cased for the same reason the status listing matches that way:
+	// Transmission's hash casing is not guaranteed to match what was stored, and
+	// here a lookup that misses reads as ErrNotFound — "already gone" — which
+	// callers act on by closing the download's row.
+	hash = strings.ToLower(hash)
 	torrents, err := c.rpc.TorrentGetHashes(ctx, []string{"id"}, []string{hash})
 	if err != nil {
 		return fmt.Errorf("transmission torrent-get for %s: %w", hash, err)

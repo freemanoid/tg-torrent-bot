@@ -42,6 +42,13 @@ const (
 	cbReject   = "rj" // ref = info hash, n unused: offer to undo a grab
 	cbRejectOK = "ro" // ref = info hash, n unused: undo confirmed
 	cbRejectNo = "rn" // ref = info hash, n unused: undo abandoned
+	// The /status buttons need their own kinds rather than reusing the reject
+	// ones: those swap the keyboard on the message they sit on, and a /status
+	// message carries one button per download, so an unlabelled yes/no in their
+	// place would not say which entry it meant.
+	cbStatusDel   = "sd" // ref = info hash, n unused: offer to delete a listed download
+	cbStatusDelOK = "so" // ref = info hash, n unused: deletion confirmed
+	cbStatusDelNo = "sn" // ref = info hash, n unused: deletion abandoned
 )
 
 // Markers stating what the bot already did with a release. They reuse the

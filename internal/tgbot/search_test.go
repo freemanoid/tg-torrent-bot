@@ -1674,6 +1674,200 @@ func TestRejectStaysQuietWhenTheRowIsAlreadyGone(t *testing.T) {
 	}
 }
 
+// --- deleting from /status ---
+
+// statusCallback builds a /status button tap. Like the reject buttons these
+// carry an info hash and are routed before the search cache, so none of these
+// tests needs a cached search at all.
+func statusCallback(kind, hash string) *models.Update {
+	cb := callbackUpdateFrom(testChatID, encodeCallback(kind, hash, 0))
+	cb.CallbackQuery.Message.Message.Text = "⬇️ Active downloads:\n\n1. Space Show S01E11\n    ▰▱▱▱▱▱▱▱▱▱ 10%"
+	return cb
+}
+
+// The list carries one button per download, so the question has to name what it
+// is about — and it must leave that list alone, both to stay readable and so
+// several downloads can be deleted one after another.
+func TestStatusDeleteAsksBeforeDeleting(t *testing.T) {
+	h, subs := newTestHandlers(&fakeSearcher{}, &fakeTrans{})
+	subs.active = []store.Download{
+		// A download the user picked out of search results: this is the case
+		// the notification buttons never covered, and the reason /status can
+		// delete at all. Nothing here may gate on Source.
+		{ID: 1, Hash: "abc123", Title: "Space Show S01E11", Source: sourceSearch, Status: store.StatusActive},
+	}
+	tg := &fakeTG{}
+
+	h.HandleCallback(context.Background(), tg, statusCallback(cbStatusDel, "abc123"))
+
+	if len(tg.edited) != 0 {
+		t.Errorf("edited %v, want the /status message left alone", tg.edited)
+	}
+	if len(tg.sent) != 1 {
+		t.Fatalf("sent %d messages, want the confirmation", len(tg.sent))
+	}
+	if text := tg.sent[0].Text; !strings.Contains(text, "Space Show S01E11") {
+		t.Errorf("confirmation %q must name the release it would delete", text)
+	}
+	kb := keyboardOf(t, tg.sent[0].ReplyMarkup)
+	if len(kb.InlineKeyboard) != 1 || len(kb.InlineKeyboard[0]) != 2 {
+		t.Fatalf("confirm keyboard = %v, want one row of two buttons", kb.InlineKeyboard)
+	}
+	for i, wantKind := range []string{cbStatusDelOK, cbStatusDelNo} {
+		kind, hash, _, err := decodeCallback(kb.InlineKeyboard[0][i].CallbackData)
+		if err != nil || kind != wantKind || hash != "abc123" {
+			t.Errorf("button %d = (%q, %q, %v), want %q for abc123", i, kind, hash, err, wantKind)
+		}
+	}
+}
+
+// The title only makes the question clearer; losing it must not cost the user
+// the ability to delete anything.
+func TestStatusDeleteAsksEvenWhenTheStoreCannotBeRead(t *testing.T) {
+	h, subs := newTestHandlers(&fakeSearcher{}, &fakeTrans{})
+	subs.getDLErr = errors.New("database is locked")
+	tg := &fakeTG{}
+
+	h.HandleCallback(context.Background(), tg, statusCallback(cbStatusDel, "abc123"))
+
+	if len(tg.sent) != 1 {
+		t.Fatalf("sent %d messages, want the confirmation anyway", len(tg.sent))
+	}
+	if text := tg.sent[0].Text; !strings.Contains(text, "this download") {
+		t.Errorf("confirmation %q should fall back to a title-less question", text)
+	}
+	if kb := keyboardOf(t, tg.sent[0].ReplyMarkup); len(kb.InlineKeyboard) != 1 {
+		t.Errorf("confirm keyboard = %v, want the buttons regardless", kb.InlineKeyboard)
+	}
+}
+
+func TestStatusDeleteConfirmedRemovesTorrentAndData(t *testing.T) {
+	tr := &fakeTrans{}
+	h, subs := newTestHandlers(&fakeSearcher{}, tr)
+	tg := &fakeTG{}
+
+	h.HandleCallback(context.Background(), tg, statusCallback(cbStatusDelOK, "abc123"))
+
+	if len(tr.removed) != 1 || tr.removed[0] != "abc123" {
+		t.Errorf("removed from Transmission = %v, want [abc123]", tr.removed)
+	}
+	if len(subs.cancelled) != 1 || subs.cancelled[0] != "abc123" {
+		t.Errorf("cancelled downloads = %v, want [abc123]", subs.cancelled)
+	}
+	// The confirmation becomes the outcome rather than leaving a spent question
+	// and a fresh answer side by side.
+	if len(tg.edited) != 1 {
+		t.Fatalf("edited %d messages, want the confirmation rewritten", len(tg.edited))
+	}
+	if text := tg.edited[0].Text; !strings.Contains(text, "🗑") || !strings.Contains(text, "deleted") {
+		t.Errorf("outcome %q must confirm the files are gone too", text)
+	}
+	if rows := keyboardOf(t, tg.edited[0].ReplyMarkup).InlineKeyboard; len(rows) != 0 {
+		t.Errorf("keyboard after deletion = %v, want no buttons left", rows)
+	}
+}
+
+// /status lists downloads reading "not in Transmission (removed externally?)",
+// and a stale button on an older listing lands here too. Clearing the row is
+// the whole point of the tap, so unlike a rejected grab it happens anyway.
+func TestStatusDeleteClearsARowTransmissionNoLongerHas(t *testing.T) {
+	tr := &fakeTrans{removeErr: fmt.Errorf("gone: %w", transmission.ErrNotFound)}
+	h, subs := newTestHandlers(&fakeSearcher{}, tr)
+	tg := &fakeTG{}
+
+	h.HandleCallback(context.Background(), tg, statusCallback(cbStatusDelOK, "abc123"))
+
+	if len(subs.cancelled) != 1 || subs.cancelled[0] != "abc123" {
+		t.Errorf("cancelled = %v, want the row closed so the entry leaves /status", subs.cancelled)
+	}
+	if len(tg.edited) != 1 {
+		t.Fatalf("edited %d messages, want the confirmation rewritten", len(tg.edited))
+	}
+	if text := tg.edited[0].Text; !strings.Contains(text, "no longer had it") {
+		t.Errorf("outcome %q should say Transmission did not have it", text)
+	}
+}
+
+// Nothing was removed, so the row must stay as it is and the buttons must stay
+// where they are for a retry.
+func TestStatusDeleteSurfacesTransmissionFailure(t *testing.T) {
+	tr := &fakeTrans{removeErr: errors.New("connection refused")}
+	h, subs := newTestHandlers(&fakeSearcher{}, tr)
+	tg := &fakeTG{}
+
+	h.HandleCallback(context.Background(), tg, statusCallback(cbStatusDelOK, "abc123"))
+
+	if text := tg.lastSentText(t); !strings.Contains(text, "connection refused") {
+		t.Errorf("reply %q must surface the Transmission failure", text)
+	}
+	if len(subs.cancelled) != 0 {
+		t.Errorf("cancelled = %v, want none when the removal failed", subs.cancelled)
+	}
+	if len(tg.edited) != 0 {
+		t.Errorf("edited %v, want the confirmation left armed for a retry", tg.edited)
+	}
+}
+
+// The torrent is gone either way; what matters is that the chat is not left
+// believing the download will finish normally.
+func TestStatusDeleteWarnsWhenTheStoreCannotBeUpdated(t *testing.T) {
+	tr := &fakeTrans{}
+	h, subs := newTestHandlers(&fakeSearcher{}, tr)
+	subs.cancelErr = errors.New("database is locked")
+	tg := &fakeTG{}
+
+	h.HandleCallback(context.Background(), tg, statusCallback(cbStatusDelOK, "abc123"))
+
+	if len(tr.removed) != 1 {
+		t.Fatalf("removed = %v, want the torrent gone regardless of the store failure", tr.removed)
+	}
+	if len(tg.edited) != 1 {
+		t.Fatalf("edited %d messages, want the outcome", len(tg.edited))
+	}
+	text := tg.edited[0].Text
+	if !strings.Contains(text, "database is locked") || !strings.Contains(text, "/status") {
+		t.Errorf("outcome %q must warn that the records could not be updated", text)
+	}
+}
+
+func TestStatusDeleteKeepDeletesNothing(t *testing.T) {
+	tr := &fakeTrans{}
+	h, subs := newTestHandlers(&fakeSearcher{}, tr)
+	tg := &fakeTG{}
+
+	h.HandleCallback(context.Background(), tg, statusCallback(cbStatusDelNo, "abc123"))
+
+	if len(tr.removed) != 0 || len(subs.cancelled) != 0 {
+		t.Fatalf("keeping must delete nothing (removed=%v cancelled=%v)", tr.removed, subs.cancelled)
+	}
+	if len(tg.edited) != 1 {
+		t.Fatalf("edited %d messages, want the confirmation answered", len(tg.edited))
+	}
+	if text := tg.edited[0].Text; !strings.Contains(text, "Kept") {
+		t.Errorf("outcome %q should confirm nothing was deleted", text)
+	}
+	// A spent confirmation left armed is a stray tap waiting to happen; the
+	// /status message it came from still has its own buttons.
+	if rows := keyboardOf(t, tg.edited[0].ReplyMarkup).InlineKeyboard; len(rows) != 0 {
+		t.Errorf("keyboard after keeping = %v, want no buttons left", rows)
+	}
+}
+
+// An inaccessible message means the outcome cannot replace it, but the tap
+// still has to produce an answer.
+func TestStatusDeleteAnswersWithoutTheOriginalMessage(t *testing.T) {
+	h, _ := newTestHandlers(&fakeSearcher{}, &fakeTrans{})
+	tg := &fakeTG{}
+	cb := statusCallback(cbStatusDelNo, "abc123")
+	cb.CallbackQuery.Message.Message = nil
+
+	h.HandleCallback(context.Background(), tg, cb)
+
+	if text := tg.lastSentText(t); !strings.Contains(text, "Kept") {
+		t.Errorf("reply %q, want confirmation that nothing was deleted", text)
+	}
+}
+
 // An inaccessible message means the keyboard cannot be restored, but the tap
 // still has to produce an answer.
 func TestKeepAnswersEvenWithoutTheOriginalMessage(t *testing.T) {

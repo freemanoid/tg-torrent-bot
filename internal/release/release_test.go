@@ -70,6 +70,27 @@ const testChangelog = `# Changelog
 - Something older.
 `
 
+// rangeChangelog has enough entries — and a two-digit minor — to pin the
+// version ordering an upgrade that skips releases depends on.
+const rangeChangelog = `# Changelog
+
+## v1.12.0
+
+- Twelve.
+
+## v1.11.0
+
+- Eleven.
+
+## v1.9.0
+
+- Nine.
+
+## v1.2.0
+
+- Two.
+`
+
 // --- Announce ---
 
 func TestAnnounceSendsOnceAfterUpgrade(t *testing.T) {
@@ -118,19 +139,51 @@ func TestAnnounceStaysQuietOnFreshInstall(t *testing.T) {
 	}
 }
 
+// Umbrel offers one update at a time but a user who skipped a few gets them
+// all in a single container restart, so the announcement has to cover every
+// version crossed — not just the one that happens to be running now.
+func TestAnnounceCoversEveryVersionSkippedOver(t *testing.T) {
+	st := newFakeStore()
+	st.meta[announcedKey] = "v1.9.0"
+	n := &fakeNotifier{}
+	a := newAnnouncer(st, n, "v1.12.0", rangeChangelog)
+
+	if err := a.Announce(context.Background()); err != nil {
+		t.Fatalf("Announce = %v", err)
+	}
+	if len(n.messages) != 1 {
+		t.Fatalf("sent %d messages, want 1 covering both versions", len(n.messages))
+	}
+	for _, want := range []string{"Twelve.", "Eleven."} {
+		if !strings.Contains(n.messages[0], want) {
+			t.Errorf("message = %q, want it to include %q", n.messages[0], want)
+		}
+	}
+	if strings.Contains(n.messages[0], "Nine.") {
+		t.Errorf("message = %q, want nothing from the version already announced", n.messages[0])
+	}
+}
+
 // A database that predates this feature has no announced version but is not a
-// fresh install: the user did upgrade and should hear about it.
+// fresh install: the user did upgrade and should hear about it — about this
+// version, not about every release ever made.
 func TestAnnounceSendsOnFirstUpgradeFromOlderBuild(t *testing.T) {
 	st := newFakeStore()
 	st.fresh = false
 	n := &fakeNotifier{}
-	a := newAnnouncer(st, n, "v1.4.0", testChangelog)
+	a := newAnnouncer(st, n, "v1.12.0", rangeChangelog)
 
 	if err := a.Announce(context.Background()); err != nil {
 		t.Fatalf("Announce = %v", err)
 	}
 	if len(n.messages) != 1 {
 		t.Fatalf("sent %d messages, want 1", len(n.messages))
+	}
+	if !strings.Contains(n.messages[0], "Twelve.") {
+		t.Errorf("message = %q, want the current version's notes", n.messages[0])
+	}
+	if strings.Contains(n.messages[0], "Eleven.") || strings.Contains(n.messages[0], "Two.") {
+		t.Errorf("message = %q, want no backlog of older entries", n.messages[0])
 	}
 }
 
@@ -303,19 +356,121 @@ func TestEmbeddedChangelogCoversItsOwnNewestEntry(t *testing.T) {
 	}
 }
 
+// --- NotesSince ---
+
+func TestNotesSince(t *testing.T) {
+	tests := []struct {
+		name         string
+		from, to     string
+		wantVersions []string
+		wantNotes    []string // first note of each returned entry
+	}{
+		{
+			name: "every version skipped over is included, newest first",
+			from: "v1.2.0", to: "v1.12.0",
+			wantVersions: []string{"v1.12.0", "v1.11.0", "v1.9.0"},
+			wantNotes:    []string{"Twelve.", "Eleven.", "Nine."},
+		},
+		{
+			name: "a single-step upgrade yields one entry",
+			from: "v1.11.0", to: "v1.12.0",
+			wantVersions: []string{"v1.12.0"},
+			wantNotes:    []string{"Twelve."},
+		},
+		{
+			// Versions are numbers, not strings: "1.9.0" < "1.11.0".
+			name: "a two-digit minor sorts above a one-digit one",
+			from: "v1.9.0", to: "v1.11.0",
+			wantVersions: []string{"v1.11.0"},
+			wantNotes:    []string{"Eleven."},
+		},
+		{
+			// A database that predates the announcement feature: announcing
+			// every entry ever written would be a wall of text.
+			name: "no recorded version yields the current entry alone",
+			from: "", to: "v1.12.0",
+			wantVersions: []string{"v1.12.0"},
+			wantNotes:    []string{"Twelve."},
+		},
+		{
+			name: "a rollback yields the current entry alone",
+			from: "v1.12.0", to: "v1.9.0",
+			wantVersions: []string{"v1.9.0"},
+			wantNotes:    []string{"Nine."},
+		},
+		{
+			name: "an unparseable recorded version yields the current entry alone",
+			from: "nightly", to: "v1.12.0",
+			wantVersions: []string{"v1.12.0"},
+			wantNotes:    []string{"Twelve."},
+		},
+		{
+			name: "a recorded version missing from the changelog still bounds the range",
+			from: "v1.10.0", to: "v1.12.0",
+			wantVersions: []string{"v1.12.0", "v1.11.0"},
+			wantNotes:    []string{"Twelve.", "Eleven."},
+		},
+		{
+			name: "a version with no entry of its own yields nothing to say",
+			from: "v1.12.0", to: "v1.13.0",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := NotesSince(rangeChangelog, tt.from, tt.to)
+			if len(got) != len(tt.wantVersions) {
+				t.Fatalf("NotesSince(%q, %q) = %v, want versions %q", tt.from, tt.to, got, tt.wantVersions)
+			}
+			for i, e := range got {
+				if e.Version != tt.wantVersions[i] {
+					t.Errorf("entry %d version = %q, want %q", i, e.Version, tt.wantVersions[i])
+				}
+				if len(e.Notes) == 0 || e.Notes[0] != tt.wantNotes[i] {
+					t.Errorf("entry %d notes = %q, want them to start with %q", i, e.Notes, tt.wantNotes[i])
+				}
+			}
+		})
+	}
+}
+
 // --- Message ---
 
 func TestMessage(t *testing.T) {
-	got := Message("v1.4.0", []string{"One.", "Two."})
+	got := Message("v1.4.0", []Entry{{Version: "v1.4.0", Notes: []string{"One.", "Two."}}})
 	want := "🚀 Updated to v1.4.0\n\nWhat's new:\n• One.\n• Two."
 	if got != want {
 		t.Errorf("Message = %q, want %q", got, want)
 	}
 }
 
+// Skipping releases must show which notes belong to which version, or the
+// whole list reads as one release's worth of news.
+func TestMessageLabelsEachVersionWhenSeveralAreAnnounced(t *testing.T) {
+	got := Message("v1.12.0", []Entry{
+		{Version: "v1.12.0", Notes: []string{"Twelve."}},
+		{Version: "v1.11.0", Notes: []string{"Eleven."}},
+	})
+	want := "🚀 Updated to v1.12.0\n\nWhat's new:\n\nv1.12.0\n• Twelve.\n\nv1.11.0\n• Eleven."
+	if got != want {
+		t.Errorf("Message = %q, want %q", got, want)
+	}
+}
+
+// The version that shipped without a changelog entry of its own must not have
+// an older entry's notes read as its own.
+func TestMessageLabelsAnEntryThatIsNotTheCurrentVersion(t *testing.T) {
+	got := Message("v1.13.0", []Entry{{Version: "v1.12.0", Notes: []string{"Twelve."}}})
+	if !strings.Contains(got, "v1.13.0") || !strings.Contains(got, "\nv1.12.0\n") {
+		t.Errorf("Message = %q, want the headline at v1.13.0 and the notes labelled v1.12.0", got)
+	}
+}
+
 func TestMessageWithoutNotes(t *testing.T) {
-	if got := Message("v1.4.0", nil); got != "🚀 Updated to v1.4.0" {
-		t.Errorf("Message = %q, want the headline alone", got)
+	for _, entries := range [][]Entry{nil, {{Version: "v1.4.0"}}} {
+		if got := Message("v1.4.0", entries); got != "🚀 Updated to v1.4.0" {
+			t.Errorf("Message(%v) = %q, want the headline alone", entries, got)
+		}
 	}
 }
 
@@ -333,11 +488,32 @@ func TestMessageTrimsOverlongNotes(t *testing.T) {
 		notes[i] = strings.Repeat("x", 100)
 	}
 
-	got := Message("v1.4.0", notes)
+	got := Message("v1.4.0", []Entry{{Version: "v1.4.0", Notes: notes}})
 	if n := len([]rune(got)); n > maxNotesRunes+100 {
 		t.Errorf("message is %d runes, want it trimmed near %d", n, maxNotesRunes)
 	}
 	if !strings.HasSuffix(got, "…") {
 		t.Errorf("trimmed message = %q, want a trailing ellipsis", got[max(0, len(got)-40):])
+	}
+}
+
+// A trim that swallows whole versions must say which ones, or the message
+// silently claims to be the full story of the upgrade.
+func TestMessageNamesTheVersionsItHadToDrop(t *testing.T) {
+	long := make([]string, 100)
+	for i := range long {
+		long[i] = strings.Repeat("x", 100)
+	}
+	got := Message("v1.12.0", []Entry{
+		{Version: "v1.12.0", Notes: long},
+		{Version: "v1.11.0", Notes: []string{"Eleven."}},
+		{Version: "v1.9.0", Notes: []string{"Nine."}},
+	})
+
+	if n := len([]rune(got)); n > maxNotesRunes+100 {
+		t.Errorf("message is %d runes, want it trimmed near %d", n, maxNotesRunes)
+	}
+	if !strings.Contains(got, "v1.11.0") || !strings.Contains(got, "v1.9.0") {
+		t.Errorf("trimmed message = %q, want the dropped versions named", got[max(0, len(got)-120):])
 	}
 }

@@ -204,6 +204,15 @@ An Umbrel update is a silent container restart, so the bot says so itself.
   cannot reach outside its own directory. **Every release needs its
   `## v<version>` entry written before the tag** — a missing entry degrades to
   the headline alone, silently.
+- **The announcement covers a range, not a version.** One restart can carry an
+  install over several releases, so `NotesSince` collects every entry after
+  `announced_version` up to the running version and `Message` heads each one
+  with its version. Versions are compared numerically (`1.9.0 < 1.11.0`);
+  anything the range cannot make sense of — no recorded version, a rollback, an
+  unreadable version — falls back to the running version's entry alone, so a
+  database that predates the feature never gets the whole changelog dumped on
+  it. `Entries` is the only parser of the markdown; `Notes` and `NotesSince`
+  are lookups over it.
 - **Send first, record second.** A failed send leaves `announced_version`
   untouched and is retried on the next start; the write itself uses
   `context.WithoutCancel` so a shutdown landing between the two does not repeat

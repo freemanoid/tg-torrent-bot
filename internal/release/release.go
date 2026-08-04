@@ -8,6 +8,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sort"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -104,7 +106,7 @@ func (a *Announcer) Announce(ctx context.Context) error {
 		return a.store.SetMeta(ctx, announcedKey, a.version)
 	}
 
-	if err := a.notifier.Notify(ctx, Message(a.version, Notes(a.changelog, a.version))); err != nil {
+	if err := a.notifier.Notify(ctx, Message(a.version, NotesSince(a.changelog, last, a.version))); err != nil {
 		return fmt.Errorf("send release announcement: %w", err)
 	}
 	// The message is out, so the version must be recorded even if the process
@@ -127,27 +129,80 @@ func released(version string) bool {
 }
 
 // Message renders the announcement: a headline naming the version, and the
-// changelog entry as a bullet list when there is one. A version with no
+// changelog entries as bullet lists when there are any. A version with no
 // changelog entry still gets the headline — that the update landed is the
 // larger half of the news.
-func Message(version string, notes []string) string {
+//
+// Several entries are each headed by their own version, because an upgrade
+// that crossed more than one release is otherwise indistinguishable from a
+// single one with a lot to say. A single entry for the version being announced
+// needs no such heading: the headline already named it.
+func Message(version string, entries []Entry) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "🚀 Updated to %s", displayVersion(version))
-	if len(notes) == 0 {
+
+	entries = withNotes(entries)
+	if len(entries) == 0 {
 		return b.String()
 	}
+	label := len(entries) > 1 || normalizeVersion(entries[0].Version) != normalizeVersion(version)
 
 	b.WriteString("\n\nWhat's new:")
 	budget := maxNotesRunes
-	for _, note := range notes {
-		budget -= utf8.RuneCountInString(note) + len("\n• ")
-		if budget < 0 {
-			b.WriteString("\n…")
+	// dropped names the entries the budget could not fit at all; a bare "…"
+	// would not say that a whole version went missing.
+	var dropped []string
+	for i, entry := range entries {
+		if label {
+			head := "\n\n" + displayVersion(entry.Version)
+			if budget-utf8.RuneCountInString(head) < 0 {
+				dropped = versionsOf(entries[i:])
+				break
+			}
+			budget -= utf8.RuneCountInString(head)
+			b.WriteString(head)
+		}
+		truncated := false
+		for _, note := range entry.Notes {
+			budget -= utf8.RuneCountInString(note) + len("\n• ")
+			if budget < 0 {
+				truncated = true
+				break
+			}
+			b.WriteString("\n• " + note)
+		}
+		if truncated {
+			dropped = versionsOf(entries[i+1:])
 			break
 		}
-		b.WriteString("\n• " + note)
+	}
+	if budget < 0 || len(dropped) > 0 {
+		b.WriteString("\n…")
+		if len(dropped) > 0 {
+			b.WriteString(" and the notes for " + strings.Join(dropped, ", "))
+		}
 	}
 	return b.String()
+}
+
+// withNotes drops entries that would render as an empty section.
+func withNotes(entries []Entry) []Entry {
+	kept := make([]Entry, 0, len(entries))
+	for _, e := range entries {
+		if len(e.Notes) > 0 {
+			kept = append(kept, e)
+		}
+	}
+	return kept
+}
+
+// versionsOf lists the entries' versions as they are displayed.
+func versionsOf(entries []Entry) []string {
+	var out []string
+	for _, e := range entries {
+		out = append(out, displayVersion(e.Version))
+	}
+	return out
 }
 
 // displayVersion prefixes a bare "1.4.0" with "v" so the message reads the
@@ -160,41 +215,158 @@ func displayVersion(version string) string {
 	return v
 }
 
+// Entry is one changelog entry: the version its heading names and the list
+// items written under it.
+type Entry struct {
+	Version string
+	Notes   []string
+}
+
+// Entries parses the whole changelog in one pass, in the order it is written
+// (newest first, by convention). It is the only reader of the markdown —
+// Notes and NotesSince are lookups over its result, so the two cannot drift.
+// Wrapped continuation lines are folded back into their item, so the changelog
+// can stay readable at 80 columns.
+func Entries(changelog string) []Entry {
+	var entries []Entry
+	for _, line := range strings.Split(changelog, "\n") {
+		trimmed := strings.TrimSpace(line)
+
+		if heading, ok := entryHeading(trimmed); ok {
+			// A headingless `##` gets an entry too: it names no version, so
+			// nothing matches it, but it still ends the previous entry.
+			entries = append(entries, Entry{Version: heading})
+			continue
+		}
+		if len(entries) == 0 {
+			continue // preamble, before any entry
+		}
+		current := &entries[len(entries)-1]
+		if item, ok := listItem(trimmed); ok {
+			current.Notes = append(current.Notes, item)
+			continue
+		}
+		if trimmed != "" && !strings.HasPrefix(trimmed, "#") && len(current.Notes) > 0 {
+			current.Notes[len(current.Notes)-1] += " " + trimmed
+		}
+	}
+	return entries
+}
+
 // Notes extracts the list items under the `## <version>` heading of a
 // changelog. Unknown versions yield no notes rather than an error: shipping a
-// tag without a changelog entry is sloppy, not broken. Wrapped continuation
-// lines are folded back into their item, so the changelog can stay readable at
-// 80 columns.
+// tag without a changelog entry is sloppy, not broken.
 func Notes(changelog, version string) []string {
 	want := normalizeVersion(version)
 	if want == "" {
 		return nil
 	}
-
-	var notes []string
-	inEntry := false
-	for _, line := range strings.Split(changelog, "\n") {
-		trimmed := strings.TrimSpace(line)
-
-		if heading, ok := entryHeading(trimmed); ok {
-			if inEntry {
-				break // the next version's entry starts here
-			}
-			inEntry = normalizeVersion(heading) == want
-			continue
-		}
-		if !inEntry {
-			continue
-		}
-		if item, ok := listItem(trimmed); ok {
-			notes = append(notes, item)
-			continue
-		}
-		if trimmed != "" && !strings.HasPrefix(trimmed, "#") && len(notes) > 0 {
-			notes[len(notes)-1] += " " + trimmed
+	for _, entry := range Entries(changelog) {
+		if normalizeVersion(entry.Version) == want {
+			return entry.Notes
 		}
 	}
-	return notes
+	return nil
+}
+
+// NotesSince returns every changelog entry released after `from` and no later
+// than `to`, newest first. Umbrel applies updates one container restart at a
+// time, but a user who let a few releases pile up crosses all of them at once
+// — announcing only `to` would silently swallow the rest.
+//
+// A range that says nothing useful — no version recorded yet, a rollback, a
+// version this changelog has never heard of — falls back to `to`'s own entry,
+// which is exactly what was sent before ranges existed. In particular an empty
+// `from` must not dump the entire changelog on a database that predates the
+// announcement feature.
+func NotesSince(changelog, from, to string) []Entry {
+	all := Entries(changelog)
+	current := func() []Entry {
+		for _, entry := range all {
+			if normalizeVersion(entry.Version) == normalizeVersion(to) {
+				return []Entry{entry}
+			}
+		}
+		return nil
+	}
+
+	if cmp, ok := compareVersions(from, to); !ok || cmp >= 0 {
+		return current()
+	}
+
+	var span []Entry
+	for _, entry := range all {
+		afterFrom, ok := compareVersions(entry.Version, from)
+		if !ok {
+			continue
+		}
+		upToTo, ok := compareVersions(entry.Version, to)
+		if !ok {
+			continue
+		}
+		if afterFrom > 0 && upToTo <= 0 {
+			span = append(span, entry)
+		}
+	}
+	if len(span) == 0 {
+		return current()
+	}
+	// The file is written newest first, but the message must not depend on
+	// whoever last edited it having kept that order.
+	sort.SliceStable(span, func(i, j int) bool {
+		cmp, _ := compareVersions(span[i].Version, span[j].Version)
+		return cmp > 0
+	})
+	return span
+}
+
+// compareVersions orders two dotted-numeric versions, reporting ok=false for
+// anything it cannot read that way. A string compare would put "1.9.0" above
+// "1.11.0" and hide a release; an unreadable version is better treated as
+// unknown than as smaller.
+func compareVersions(a, b string) (int, bool) {
+	left, ok := versionParts(a)
+	if !ok {
+		return 0, false
+	}
+	right, ok := versionParts(b)
+	if !ok {
+		return 0, false
+	}
+	for i := 0; i < len(left) || i < len(right); i++ {
+		var l, r int
+		if i < len(left) {
+			l = left[i]
+		}
+		if i < len(right) {
+			r = right[i]
+		}
+		if l != r {
+			if l < r {
+				return -1, true
+			}
+			return 1, true
+		}
+	}
+	return 0, true
+}
+
+// versionParts splits "v1.12.0" into its numeric segments.
+func versionParts(v string) ([]int, bool) {
+	v = normalizeVersion(v)
+	if v == "" {
+		return nil, false
+	}
+	fields := strings.Split(v, ".")
+	parts := make([]int, 0, len(fields))
+	for _, field := range fields {
+		n, err := strconv.Atoi(field)
+		if err != nil || n < 0 {
+			return nil, false
+		}
+		parts = append(parts, n)
+	}
+	return parts, true
 }
 
 // entryHeading returns the version named by a `## …` heading.

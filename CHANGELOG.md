@@ -5,6 +5,15 @@ the binary: after an update the bot posts the entry matching the version it is
 running, so keep entries short, plain, and headed `## v<version>` — the same
 version the git tag carries.
 
+## v1.12.1
+
+- The "updated to" message now covers every version an update crossed. Umbrel
+  can carry you over several releases in one restart — v1.10.0 straight to
+  v1.12.0 — and until now only the version you landed on was announced, so
+  whatever the ones in between brought was never mentioned. Each version now
+  gets its own headed list, newest first, and a jump long enough to overflow
+  one message names the versions it could not fit.
+
 ## v1.12.0
 
 - `/status` can now delete. Every download it lists — running or recently
